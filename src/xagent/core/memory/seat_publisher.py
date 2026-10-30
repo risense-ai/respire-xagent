@@ -77,6 +77,8 @@ class TrustedSeatPublisher:
         self._authorities: dict[AgentSeatRequest, tuple[VerifiedSeatGrant, int]] = {}
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._listener_cleaned = threading.Event()
         self._stop = threading.Event()
         self._server: socketserver.UnixStreamServer | None = None
         self._thread: threading.Thread | None = None
@@ -299,39 +301,45 @@ class TrustedSeatPublisher:
             )
 
     def start(self) -> None:
-        self._acquire_writer()
+        with self._close_lock:
+            if self._stop.is_set() or self._writer_fd is not None:
+                raise RuntimeError("publisher already started or closed")
+            self._acquire_writer()
         try:
             self.refresh()  # verify fresh; never restore journal grants
-            path = Path(str(self.path) + ".sock")
-            if path.exists():
-                if not stat.S_ISSOCK(path.lstat().st_mode):
-                    raise ValueError("publisher socket path is occupied")
-                path.unlink()  # exclusive writer lock proves no live publisher owns it
-            publisher = self
+            with self._close_lock:
+                if self._stop.is_set():
+                    raise RuntimeError("publisher closed during startup")
+                path = Path(str(self.path) + ".sock")
+                if path.exists():
+                    if not stat.S_ISSOCK(path.lstat().st_mode):
+                        raise ValueError("publisher socket path is occupied")
+                    path.unlink()  # exclusive writer lock proves no live publisher owns it
+                publisher = self
 
-            class Handler(socketserver.StreamRequestHandler):
-                def handle(self) -> None:
-                    self.request.settimeout(1)
-                    try:
-                        nonce = self.rfile.readline(66).decode().strip()
-                        self.wfile.write(publisher._acknowledge(nonce))
-                    except (OSError, UnicodeError):
-                        return
+                class Handler(socketserver.StreamRequestHandler):
+                    def handle(self) -> None:
+                        self.request.settimeout(1)
+                        try:
+                            nonce = self.rfile.readline(66).decode().strip()
+                            self.wfile.write(publisher._acknowledge(nonce))
+                        except (OSError, UnicodeError):
+                            return
 
-            class Server(socketserver.ThreadingUnixStreamServer):
-                daemon_threads = True
-                block_on_close = False
+                class Server(socketserver.ThreadingUnixStreamServer):
+                    daemon_threads = True
+                    block_on_close = False
 
-            self._server = Server(str(path), Handler)
-            path.chmod(0o600)
-            self._thread = threading.Thread(
-                target=self._run, name="memory-grant-publisher", daemon=True
-            )
-            self._thread.start()
-            self._verification_thread = threading.Thread(
-                target=self._verify_loop, name="memory-grant-verifier", daemon=True
-            )
-            self._verification_thread.start()
+                self._server = Server(str(path), Handler)
+                path.chmod(0o600)
+                self._thread = threading.Thread(
+                    target=self._run, name="memory-grant-publisher", daemon=True
+                )
+                self._thread.start()
+                self._verification_thread = threading.Thread(
+                    target=self._verify_loop, name="memory-grant-verifier", daemon=True
+                )
+                self._verification_thread.start()
         except BaseException:
             self.close()
             raise
@@ -359,6 +367,10 @@ class TrustedSeatPublisher:
         )
 
     def _release_writer(self) -> None:
+        # A replacement may bind the same pathname immediately after flock is
+        # released. Never let an old close() unlink that replacement's socket.
+        if not self._listener_cleaned.is_set():
+            return
         if not self._refresh_lock.acquire(timeout=0.1):
             return
         try:
@@ -372,23 +384,27 @@ class TrustedSeatPublisher:
         # Bound shutdown even when a host verifier stalls. Do not release the
         # single-writer lock while that thread could still be executing.
         self._stop.set()
-        if (
-            self._server is not None
-            and self._thread is not None
-            and self._thread.is_alive()
-        ):
-            self._server.shutdown()
-        if self._thread is not None:
-            if self._thread.ident is not None:
-                self._thread.join(timeout=2)
-            self._thread = None
-        if self._server is not None:
-            self._server.server_close()
-            Path(str(self.path) + ".sock").unlink(missing_ok=True)
-            self._server = None
-        if self._verification_thread is not None:
-            if self._verification_thread.ident is not None:
-                self._verification_thread.join(timeout=2)
-            if not self._verification_thread.is_alive():
-                self._verification_thread = None
-        self._release_writer()
+        with self._close_lock:
+            if (
+                self._server is not None
+                and self._thread is not None
+                and self._thread.is_alive()
+            ):
+                self._server.shutdown()
+            if self._thread is not None:
+                if self._thread.ident is not None:
+                    self._thread.join(timeout=2)
+                self._thread = None
+            if self._server is not None:
+                self._server.server_close()
+                Path(str(self.path) + ".sock").unlink(missing_ok=True)
+                self._server = None
+            # Publish cleanup completion only after no old close can touch
+            # the socket path. A slow verifier may release the writer later.
+            self._listener_cleaned.set()
+            if self._verification_thread is not None:
+                if self._verification_thread.ident is not None:
+                    self._verification_thread.join(timeout=2)
+                if not self._verification_thread.is_alive():
+                    self._verification_thread = None
+            self._release_writer()

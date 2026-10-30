@@ -253,3 +253,116 @@ def test_expiry_is_not_extended_while_verification_is_blocked(
             store.validate_identity_context()
         with delegated_agent_identity(7, store=store):
             assert store.validate_identity_context() == "agent:7"
+
+
+@pytest.mark.parametrize("phase", ["listener_close", "socket_unlink"])
+def test_shutdown_takeover_waits_for_old_socket_cleanup(
+    live: Any, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    path, journal, source, publisher, _reader, _store, _transport = live
+    socket_path = Path(str(path) + ".sock")
+    entered, release = threading.Event(), threading.Event()
+    close_ident: list[int] = []
+    old_verifier = publisher._verification_thread
+    assert old_verifier is not None and publisher._server is not None
+
+    if phase == "listener_close":
+        original_close = publisher._server.server_close
+
+        def paused_close() -> None:
+            entered.set()
+            assert release.wait(3)
+            original_close()
+
+        monkeypatch.setattr(publisher._server, "server_close", paused_close)
+    else:
+        original_unlink = Path.unlink
+
+        def paused_unlink(target: Path, *args: Any, **kwargs: Any) -> None:
+            if target == socket_path and threading.get_ident() in close_ident:
+                entered.set()
+                assert release.wait(3)
+            original_unlink(target, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", paused_unlink)
+
+    def close_old() -> None:
+        close_ident.append(threading.get_ident())
+        publisher.close()
+
+    contender = TrustedSeatPublisher(path, journal, source)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(close_old)
+        try:
+            assert entered.wait(1)
+            # Deterministically let the verifier's stop/finally finish before
+            # takeover. It must not release flock ahead of socket cleanup.
+            old_verifier.join(timeout=1)
+            assert not old_verifier.is_alive()
+            with pytest.raises(BlockingIOError):
+                contender.start()
+        finally:
+            release.set()
+            pending.result(timeout=2)
+            contender.close()
+
+    successor = TrustedSeatPublisher(path, journal, source)
+    successor.start()
+    reader = FileAgentSeatProvider(path)
+    try:
+        assert reader.refresh() and reader(publisher_fixtures.REQUEST) is not None
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _index: publisher.close(), range(4)))
+        assert socket_path.exists()
+        assert reader.refresh()  # old cleanup did not unlink successor's socket
+        with pytest.raises(RuntimeError, match="already started or closed"):
+            publisher.start()
+    finally:
+        reader.close()
+        successor.close()
+
+
+def test_slow_verifier_retains_writer_until_listener_cleanup_and_verify_exit(
+    tmp_path: Path,
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    calls = [0]
+
+    def source() -> Any:
+        calls[0] += 1
+        if calls[0] > 1:
+            entered.set()
+            assert release.wait(5)
+        return (publisher_fixtures.GRANT,)
+
+    path, journal = tmp_path / "grants.json", tmp_path / "journal.json"
+    publisher = TrustedSeatPublisher(path, journal, source, poll_seconds=0.01)
+    publisher.start()
+    contender = TrustedSeatPublisher(path, journal, lambda: (publisher_fixtures.GRANT,))
+    try:
+        assert entered.wait(1)
+        verifier_thread = publisher._verification_thread
+        assert verifier_thread is not None
+        original = path.read_bytes()
+        start = time.monotonic()
+        publisher.close()
+        assert time.monotonic() - start < 3
+        assert not Path(str(path) + ".sock").exists()
+        with pytest.raises(BlockingIOError):
+            contender.start()
+        release.set()
+        verifier_thread.join(timeout=1)
+        assert not verifier_thread.is_alive()
+        assert path.read_bytes() == original  # no late publication after stop
+        contender.start()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _index: publisher.close(), range(4)))
+        reader = FileAgentSeatProvider(path)
+        try:
+            assert reader.refresh() and reader(publisher_fixtures.REQUEST) is not None
+        finally:
+            reader.close()
+    finally:
+        release.set()
+        publisher.close()
+        contender.close()
