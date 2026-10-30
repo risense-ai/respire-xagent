@@ -301,6 +301,7 @@ MEMORY_BACKEND = "XAGENT_MEMORY_BACKEND"
 MEMORY_SERVICE_URL = "XAGENT_MEMORY_SERVICE_URL"
 MEMORY_SERVICE_KEY = "XAGENT_MEMORY_SERVICE_KEY"
 MEMORY_AGENT_SEATS = "XAGENT_MEMORY_AGENT_SEATS"
+MEMORY_AGENT_BINDINGS = "XAGENT_MEMORY_AGENT_BINDINGS"
 
 WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
 
@@ -4022,3 +4023,8 @@ def get_memory_agent_seats_enabled() -> bool:
     A disabled switch explicitly keeps the authenticated parent identity.
     """
     return _get_bool_env(MEMORY_AGENT_SEATS, True)
+
+
+def get_memory_agent_bindings() -> str | None:
+    """Administrator-supplied initialization bindings; never a request input."""
+    return os.getenv(MEMORY_AGENT_BINDINGS)

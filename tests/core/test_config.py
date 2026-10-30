@@ -3927,3 +3927,14 @@ def test_execution_budget_env_default_cannot_exceed_maximum(monkeypatch):
     monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_MAX_TOKENS", "100")
     with pytest.raises(ValueError, match="must not exceed"):
         get_execution_budget_defaults()
+
+
+@pytest.mark.parametrize("value", [None, "[]", "fixture-only"])
+def test_memory_agent_bindings_are_system_config_only(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv(config.MEMORY_AGENT_BINDINGS, raising=False)
+    else:
+        monkeypatch.setenv(config.MEMORY_AGENT_BINDINGS, value)
+    assert config.get_memory_agent_bindings() == value
