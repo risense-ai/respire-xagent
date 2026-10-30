@@ -29,6 +29,8 @@ class MemoryPolicyDecision:
     enabled: bool
     available: bool
     reason: str | None = None
+    remote_status: str | None = None
+    semantic_available: bool | None = None
 
 
 MemoryPolicyResolver = Callable[[MemoryPolicyRequest], MemoryPolicyDecision]
@@ -74,6 +76,18 @@ def _validate_decision(decision: object) -> None:
         raise TypeError("memory policy resolver returned an invalid decision type")
     if type(decision.enabled) is not bool or type(decision.available) is not bool:
         raise TypeError("memory policy decision flags must be bool")
+    if decision.remote_status is not None and decision.remote_status not in {
+        "ready",
+        "degraded",
+        "unavailable",
+        "protocol_error",
+    }:
+        raise TypeError("invalid remote memory status")
+    if (
+        decision.semantic_available is not None
+        and type(decision.semantic_available) is not bool
+    ):
+        raise TypeError("semantic availability must be bool")
     if decision.enabled and not decision.available:
         raise ValueError("unavailable memory cannot be enabled")
     if decision.reason is not None and (

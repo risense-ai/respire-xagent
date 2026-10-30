@@ -24,7 +24,7 @@ from typing import Optional, Union
 from ..core.memory.base import MemoryStore
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
-from ..core.memory.remote import RemoteMemoryStore
+from ..core.memory.remote import RemoteMemoryStore, remote_memory_readiness
 from .memory_lifecycle import (
     AdmissionResult,
     AuthorityCredentialUnavailable,
@@ -36,6 +36,7 @@ from .memory_lifecycle import (
     default_similarity_threshold,
     log_operator_guidance,
     remote_admission_result,
+    remote_lifecycle_status,
 )
 from .models.database import get_db
 from .revocable_memory_store import RevocableMemoryStore, unwrap_memory_store
@@ -327,7 +328,10 @@ class DynamicMemoryStoreManager:
 
     def status(self) -> MemoryLifecycleStatus:
         """Current public-safe lifecycle status. Never admits."""
-        return self.acquire()[1]
+        store, status = self.acquire()
+        if isinstance(unwrap_memory_store(store), RemoteMemoryStore):
+            return remote_lifecycle_status(remote_memory_readiness())
+        return status
 
     def force_reinitialize(self) -> None:
         """Retained no-op: rebuilding a live store is an online reload.
@@ -387,6 +391,8 @@ class DynamicMemoryStoreManager:
         # Report what the storage adapter actually is, through both the
         # revocation and the user-isolation wrapper.
         base_store = unwrap_memory_store(store)
+        if isinstance(base_store, RemoteMemoryStore):
+            status = remote_lifecycle_status(remote_memory_readiness())
         return {
             "store_type": type(base_store).__name__ if base_store is not None else None,
             "is_lancedb": isinstance(base_store, LanceDBMemoryStore),
@@ -394,6 +400,8 @@ class DynamicMemoryStoreManager:
             "detail": status.detail,
             "mode": status.mode.value if status.mode is not None else None,
             "supports_vector_search": status.vector_search,
+            "remote_status": status.remote_status,
+            "reason": status.reason,
             "similarity_threshold": threshold,
         }
 
