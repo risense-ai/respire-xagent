@@ -51,6 +51,17 @@ from xagent.web.services.memory_policy import (
 _RESOLVER_AT_IMPORT = memory_policy_module._trusted_memory_policy_resolver  # noqa: SLF001
 
 
+@pytest.fixture(autouse=True)
+def trusted_user_context():
+    from xagent.core.user_context import current_user_id
+
+    token = current_user_id.set(23)
+    try:
+        yield
+    finally:
+        current_user_id.reset(token)
+
+
 def _select_remote(monkeypatch: Any, *, key: str | None = "svc-key") -> None:
     monkeypatch.setenv("XAGENT_MEMORY_BACKEND", "remote")
     monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", "http://memsrv:8080")
@@ -486,3 +497,52 @@ def test_runtime_policy_metadata_preserves_remote_capabilities(
         "memory_remote_status": "degraded",
         "memory_semantic_available": False,
     }
+
+
+@pytest.mark.parametrize("identity", [None, 0, "", " "])
+@pytest.mark.parametrize("agent_id", [None, 41])
+def test_policy_missing_identity_does_not_probe(
+    monkeypatch: Any, identity: Any, agent_id: Any
+) -> None:
+    from dataclasses import replace
+
+    from xagent.core.memory.remote import IDENTITY_REQUIRED_REASON
+
+    _select_remote(monkeypatch)
+    monkeypatch.setattr(
+        lifecycle_module,
+        "remote_memory_readiness",
+        lambda **_: pytest.fail("identity must precede readiness"),
+    )
+    decision = lifecycle_module.resolve_remote_memory_policy(
+        replace(_policy_request(), user_id=identity, agent_id=agent_id)
+    )
+    assert decision == MemoryPolicyDecision(
+        enabled=False, available=False, reason=IDENTITY_REQUIRED_REASON
+    )
+
+
+def test_remote_user_reports_require_identity_before_any_probe(
+    monkeypatch: Any,
+) -> None:
+    from xagent.core.memory.remote import RemoteMemoryStoreIdentityError
+    from xagent.core.user_context import current_user_id
+
+    _select_remote(monkeypatch)
+    manager = DynamicMemoryStoreManager()
+    manager.admit()
+    # Also intercept R2's structured probe when this PR is integrated with R2.
+    monkeypatch.setattr(
+        manager_module,
+        "remote_memory_readiness",
+        lambda: pytest.fail("probe preceded identity"),
+        raising=False,
+    )
+    token = current_user_id.set(None)
+    try:
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            manager.status()
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            manager.get_store_info()
+    finally:
+        current_user_id.reset(token)

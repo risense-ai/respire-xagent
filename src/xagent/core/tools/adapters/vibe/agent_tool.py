@@ -1949,7 +1949,9 @@ _DELEGATED_MEMORY_DISABLED_REASON = "delegated_memory_disabled"
 _DELEGATED_MEMORY_UNAVAILABLE_REASON = "delegated_memory_unavailable"
 
 
-def _resolve_delegated_parent_memory() -> tuple[Optional[Any], bool, Optional[str]]:
+def _resolve_delegated_parent_memory(
+    *, user_id: Optional[int] = None, agent_id: Optional[int] = None
+) -> tuple[Optional[Any], bool, Optional[str]]:
     """Resolve the delegating task's memory store for a child run (T14 §B2).
 
     Returns ``(store, available, reason)``:
@@ -1971,10 +1973,18 @@ def _resolve_delegated_parent_memory() -> tuple[Optional[Any], bool, Optional[st
     """
     try:
         from .....config import get_memory_backend
-        from .....core.memory.remote import remote_memory_ready
+        from .....core.memory.remote import (
+            RemoteMemoryStoreIdentityError,
+            remote_memory_ready,
+            require_delegated_memory_identity,
+        )
 
         if get_memory_backend() != "remote":
             return None, False, _DELEGATED_MEMORY_DISABLED_REASON
+        try:
+            require_delegated_memory_identity(agent_id, user_id=user_id)
+        except RemoteMemoryStoreIdentityError as error:
+            return None, False, str(error)
         available, reason = remote_memory_ready()
         if not available:
             return None, False, reason or _DELEGATED_MEMORY_UNAVAILABLE_REASON
@@ -1989,26 +1999,10 @@ def _resolve_delegated_parent_memory() -> tuple[Optional[Any], bool, Optional[st
 def _delegated_agent_identity_scope(
     agent_id: Optional[int], store: Optional[Any]
 ) -> Any:
-    """The identity switch a delegated child runs under (T14 §0.2 item 6).
+    """Apply the remote adapter's identity policy without fallback on failure."""
+    from .....core.memory.remote import delegated_agent_identity
 
-    When the target agent is registered as a seat on the memory service, the
-    child's memory calls carry that seat's identity instead of the parent's.
-    ``store`` pins the switch to the remote backend: a local or in-memory store
-    has no identity to switch, and holding the scope open for one would make the
-    probe run for nothing.
-
-    Never raises and never blocks a delegation: any import or lookup problem
-    returns a no-op context, so the child keeps the historical parent identity.
-    """
-    from contextlib import nullcontext
-
-    try:
-        from .....core.memory.remote import delegated_agent_identity
-
-        return delegated_agent_identity(agent_id, store=store)
-    except Exception as error:  # noqa: BLE001 - delegation must not fail on this
-        logger.debug("Delegated agent identity unavailable: %s", error)
-        return nullcontext()
+    return delegated_agent_identity(agent_id, store=store)
 
 
 class AgentTool(AbstractBaseTool):
@@ -2683,7 +2677,9 @@ class AgentTool(AbstractBaseTool):
                     delegated_memory,
                     delegated_memory_available,
                     delegated_memory_reason,
-                ) = _resolve_delegated_parent_memory()
+                ) = _resolve_delegated_parent_memory(
+                    user_id=self._user_id, agent_id=self._agent_id
+                )
                 agent_service = AgentService(
                     name=agent_name,
                     llm=default_llm,
@@ -2739,9 +2735,9 @@ class AgentTool(AbstractBaseTool):
                     if self._execution_scope is not None
                     else nullcontext()
                 )
-                # T14 §0.2 item 6: run the child under its own seat when the
-                # memory service knows one for this target agent; otherwise this
-                # is a no-op and the child keeps the parent identity.
+                # Independent mode requires a current trusted seat publication.
+                # Missing mappings disable memory during preflight; a mapping
+                # revoked after preflight rejects further memory requests.
                 identity_context = _delegated_agent_identity_scope(
                     self._agent_id, delegated_memory
                 )

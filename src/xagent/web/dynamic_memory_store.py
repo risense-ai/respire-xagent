@@ -28,6 +28,7 @@ from ..core.memory.remote import (
     RemoteMemoryStore,
     remote_memory_readiness,
     remote_upstream_report,
+    require_remote_memory_identity,
 )
 from .memory_lifecycle import (
     AdmissionResult,
@@ -330,8 +331,24 @@ class DynamicMemoryStoreManager:
             raise MemoryUnavailableError(status)
         return store
 
-    def status(self) -> MemoryLifecycleStatus:
+    def _guard_remote_report(self, *, control_plane: bool) -> None:
+        """User reports require identity before any remote dependency probe.
+
+        Startup/background health callers may explicitly use the independent
+        control plane. That flag must never come from a user request parameter.
+        """
+        with self._lock:
+            publication = self._publication
+        if (
+            not control_plane
+            and publication is not None
+            and isinstance(unwrap_memory_store(publication.store), RemoteMemoryStore)
+        ):
+            require_remote_memory_identity()
+
+    def status(self, *, control_plane: bool = False) -> MemoryLifecycleStatus:
         """Current public-safe lifecycle status. Never admits."""
+        self._guard_remote_report(control_plane=control_plane)
         store, status = self.acquire()
         if isinstance(unwrap_memory_store(store), RemoteMemoryStore):
             return remote_lifecycle_status(remote_memory_readiness())
@@ -362,7 +379,7 @@ class DynamicMemoryStoreManager:
             self._revalidated_publication_locked()
             return before is not self._publication
 
-    def get_store_info(self) -> dict:
+    def get_store_info(self, *, control_plane: bool = False) -> dict:
         """Public-safe description of the current memory store.
 
         Degrades instead of raising. This is the one report an operator has
@@ -379,6 +396,7 @@ class DynamicMemoryStoreManager:
         write through a store this manager could not revalidate. A status
         report is the one caller for which answering beats failing.
         """
+        self._guard_remote_report(control_plane=control_plane)
         with self._lock:
             try:
                 store, status = self.acquire()
@@ -470,7 +488,7 @@ def admit_memory_storage_at_startup() -> Optional[MemoryLifecycleStatus]:
     """
     try:
         status = admit_memory_storage()
-        store_info = get_memory_store_manager().get_store_info()
+        store_info = get_memory_store_manager().get_store_info(control_plane=True)
     except Exception:
         # Memory must never be able to abort a boot. Unrelated functions start;
         # memory itself stays closed until an operator acts.

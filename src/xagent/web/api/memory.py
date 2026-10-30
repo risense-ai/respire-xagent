@@ -486,9 +486,10 @@ class MemoryManagementRouter:
                 # request-scoped connection is still held, so on a
                 # single-slot pool the nested checkout would be waiting on
                 # the very thread that has to release it.
-                return await run_db_io_cancellation_safe(
-                    get_memory_store_manager().get_store_info
-                )
+                with UserContext(int(user.id)):
+                    return await run_db_io_cancellation_safe(
+                        get_memory_store_manager().get_store_info
+                    )
             except Exception:
                 logger.exception("Failed to read memory store info")
                 raise HTTPException(

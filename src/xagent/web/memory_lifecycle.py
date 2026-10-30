@@ -52,8 +52,10 @@ from ..core.memory.lancedb_maintenance import (
 from ..core.memory.remote import (
     RemoteMemoryReadiness,
     RemoteMemoryStoreConfigurationError,
+    RemoteMemoryStoreIdentityError,
     remote_memory_readiness,
     remote_memory_store_from_config,
+    require_remote_memory_identity,
 )
 from ..core.memory.vector_compatibility import (
     canonical_embedding_identity,
@@ -528,8 +530,16 @@ def resolve_remote_memory_policy(
     Preview and local-backend tasks retain the native enablement rule. Remote
     tasks share the structured health cache with lifecycle reporting; storage
     availability and semantic capability are distinct. The trusted caller must
-    establish identity before consulting this health probe.
+    establish identity before consulting this health probe: a missing identity
+    fails the decision closed without touching the service.
     """
+    if get_memory_backend() == "remote" and not request.is_preview:
+        try:
+            require_remote_memory_identity(request.user_id)
+        except RemoteMemoryStoreIdentityError as error:
+            return MemoryPolicyDecision(
+                enabled=False, available=False, reason=str(error)
+            )
     if get_memory_backend() != "remote" or request.is_preview:
         return MemoryPolicyDecision(
             enabled=not request.is_preview and request.agent_id is None,

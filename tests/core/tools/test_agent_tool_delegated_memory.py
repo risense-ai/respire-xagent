@@ -24,6 +24,7 @@ not about a re-implementation of them.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 from typing import cast
@@ -139,6 +140,9 @@ def _patch_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _select_remote(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XAGENT_MEMORY_BACKEND", "remote")
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", "http://memsrv:8080")
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", "svc-key")
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "0")
 
 
 def _patch_readiness(
@@ -191,7 +195,7 @@ def test_no_remote_backend_disables_delegated_memory(
         monkeypatch, (True, None)
     )  # a probe here would be the bug, not the answer
 
-    assert _resolve_delegated_parent_memory() == (
+    assert _resolve_delegated_parent_memory(user_id=1) == (
         None,
         False,
         _DELEGATED_MEMORY_DISABLED_REASON,
@@ -206,7 +210,7 @@ def test_ready_service_publishes_the_parent_store(
     parent_store = object()
     _patch_published_store(monkeypatch, parent_store)
 
-    assert _resolve_delegated_parent_memory() == (parent_store, True, None)
+    assert _resolve_delegated_parent_memory(user_id=1) == (parent_store, True, None)
 
 
 def test_unready_service_disables_memory_with_its_reason(
@@ -219,7 +223,7 @@ def test_unready_service_disables_memory_with_its_reason(
         _forbidden_store("an unreachable service must not hand out a store"),
     )
 
-    assert _resolve_delegated_parent_memory() == (
+    assert _resolve_delegated_parent_memory(user_id=1) == (
         None,
         False,
         READINESS_UNAVAILABLE_REASON,
@@ -236,7 +240,7 @@ def test_unready_service_without_a_reason_reports_the_generic_one(
         _forbidden_store("an unreachable service must not hand out a store"),
     )
 
-    assert _resolve_delegated_parent_memory() == (
+    assert _resolve_delegated_parent_memory(user_id=1) == (
         None,
         False,
         _DELEGATED_MEMORY_UNAVAILABLE_REASON,
@@ -256,7 +260,7 @@ def test_a_broken_store_lookup_fails_closed_instead_of_raising(
 
     monkeypatch.setattr(store_module, "get_memory_store", explode)
 
-    assert _resolve_delegated_parent_memory() == (
+    assert _resolve_delegated_parent_memory(user_id=1) == (
         None,
         False,
         _DELEGATED_MEMORY_UNAVAILABLE_REASON,
@@ -432,19 +436,35 @@ def _publish_remote_store(monkeypatch: pytest.MonkeyPatch, session: object) -> o
 
 
 def _patch_seats(monkeypatch: pytest.MonkeyPatch, answer: object) -> None:
-    from xagent.core.memory import remote as remote_module
+    from xagent.core.memory import agent_seats
 
-    monkeypatch.setattr(
-        remote_module,
-        "registered_agent_seats",
-        answer if callable(answer) else (lambda **_kwargs: answer),
-    )
+    registry = agent_seats.TrustedAgentSeatRegistry()
+    if callable(answer):
+
+        def provider(_request):
+            return answer()
+    else:
+        refs, _reason = answer
+        if refs is not None:
+            registry.publish(
+                service_url="http://memsrv:8080",
+                user_id=1,
+                runtime_profile=hashlib.sha256(b"svc-key").hexdigest(),
+                agent_ids=[int(ref) for ref in refs],
+                ttl_seconds=30,
+                status="active",
+            )
+        provider = registry
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "1")
+    monkeypatch.setattr(agent_seats, "_provider", provider)
+    monkeypatch.setattr(agent_seats, "_provider_generation", 1)
 
 
 async def _run_delegation_with_memory_call(
     monkeypatch: pytest.MonkeyPatch, session: _FakeStoreSession
-) -> _FakeStoreSession:
+) -> dict[str, object]:
     _select_remote(monkeypatch)
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "1")
     _patch_readiness(monkeypatch, (True, None))
     _publish_remote_store(monkeypatch, session)
     _patch_runtime_with_service(monkeypatch, _MemoryCallingAgentService)
@@ -453,8 +473,7 @@ async def _run_delegation_with_memory_call(
 
     result = await tool.run_json_async({"task": "run"})
 
-    assert result == {"response": "child answer"}
-    return session
+    return result
 
 
 async def test_child_runs_under_its_seat_when_the_service_knows_one(
@@ -463,24 +482,28 @@ async def test_child_runs_under_its_seat_when_the_service_knows_one(
     _patch_seats(monkeypatch, (frozenset({"1"}), None))
     session = _FakeStoreSession([_json_response({"results": []})])
 
-    await _run_delegation_with_memory_call(monkeypatch, session)
-
+    result = await _run_delegation_with_memory_call(monkeypatch, session)
+    assert result == {"response": "child answer"}
     assert session.calls[-1]["headers"]["X-User-External-Id"] == "agent:1"  # type: ignore[index]
 
 
-async def test_child_keeps_the_parent_identity_without_a_seat(
+async def test_child_rejects_independent_mode_without_a_seat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The probe answered, but agent 1 has no seat: the historical identity stays.
+    # A missing independent seat cannot borrow the parent identity.
     _patch_seats(monkeypatch, (frozenset({"2"}), None))
     session = _FakeStoreSession([_json_response({"results": []})])
 
-    await _run_delegation_with_memory_call(monkeypatch, session)
+    result = await _run_delegation_with_memory_call(monkeypatch, session)
+    assert result == {"response": "child answer"}
+    child = _RecordingAgentService.instances[-1]
+    assert child.kwargs["memory"] is None
+    assert child.kwargs["memory_available"] is False
+    assert child.kwargs["memory_availability_reason"]
+    assert session.calls == []
 
-    assert session.calls[-1]["headers"]["X-User-External-Id"] == "1"  # type: ignore[index]
 
-
-async def test_child_keeps_the_parent_identity_when_the_seat_probe_fails(
+async def test_child_rejects_independent_mode_when_mapping_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from xagent.core.memory.remote import AGENT_SEATS_PROBE_FAILED_REASON
@@ -488,12 +511,16 @@ async def test_child_keeps_the_parent_identity_when_the_seat_probe_fails(
     _patch_seats(monkeypatch, (None, AGENT_SEATS_PROBE_FAILED_REASON))
     session = _FakeStoreSession([_json_response({"results": []})])
 
-    await _run_delegation_with_memory_call(monkeypatch, session)
+    result = await _run_delegation_with_memory_call(monkeypatch, session)
+    assert result == {"response": "child answer"}
+    child = _RecordingAgentService.instances[-1]
+    assert child.kwargs["memory"] is None
+    assert child.kwargs["memory_available"] is False
+    assert child.kwargs["memory_availability_reason"]
+    assert session.calls == []
 
-    assert session.calls[-1]["headers"]["X-User-External-Id"] == "1"  # type: ignore[index]
 
-
-async def test_a_raising_seat_probe_never_fails_the_delegation(
+async def test_a_raising_seat_lookup_never_retries_as_parent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def explode(**_kwargs: object) -> object:
@@ -502,9 +529,13 @@ async def test_a_raising_seat_probe_never_fails_the_delegation(
     _patch_seats(monkeypatch, explode)
     session = _FakeStoreSession([_json_response({"results": []})])
 
-    await _run_delegation_with_memory_call(monkeypatch, session)
-
-    assert session.calls[-1]["headers"]["X-User-External-Id"] == "1"  # type: ignore[index]
+    result = await _run_delegation_with_memory_call(monkeypatch, session)
+    assert result == {"response": "child answer"}
+    child = _RecordingAgentService.instances[-1]
+    assert child.kwargs["memory"] is None
+    assert child.kwargs["memory_available"] is False
+    assert child.kwargs["memory_availability_reason"]
+    assert session.calls == []
 
 
 async def test_a_non_remote_parent_store_never_triggers_the_seat_probe(
@@ -526,3 +557,44 @@ async def test_a_non_remote_parent_store_never_triggers_the_seat_probe(
     (child,) = _RecordingAgentService.instances
     assert child.kwargs["memory"] is not None
     assert child.kwargs["memory_enabled"] is True
+
+
+@pytest.mark.parametrize("identity", [None, 0, "", " "])
+def test_missing_delegating_identity_never_probes_readiness(
+    monkeypatch: pytest.MonkeyPatch, identity: object
+) -> None:
+    from xagent.core.memory.remote import IDENTITY_REQUIRED_REASON
+
+    _select_remote(monkeypatch)
+    _patch_readiness(monkeypatch, (True, None))
+    from xagent.core.memory import remote as remote_module
+
+    monkeypatch.setattr(
+        remote_module, "remote_memory_ready", lambda: pytest.fail("unexpected readyz")
+    )
+    assert _resolve_delegated_parent_memory(user_id=identity) == (
+        None,
+        False,
+        IDENTITY_REQUIRED_REASON,
+    )
+
+
+def test_missing_independent_mapping_never_probes_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.memory import remote as remote_module
+    from xagent.core.memory.remote import AGENT_SEAT_REQUIRED_REASON
+
+    _select_remote(monkeypatch)
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "1")
+    from xagent.core.memory import agent_seats
+
+    monkeypatch.setattr(agent_seats, "_provider", None)
+    monkeypatch.setattr(
+        remote_module, "remote_memory_ready", lambda: pytest.fail("unexpected readyz")
+    )
+    assert _resolve_delegated_parent_memory(user_id=1, agent_id=7) == (
+        None,
+        False,
+        AGENT_SEAT_REQUIRED_REASON,
+    )
