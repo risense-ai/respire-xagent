@@ -1271,3 +1271,31 @@ def test_delegated_agent_identity_can_be_switched_off(
 
     assert calls.calls[0]["headers"]["X-User-External-Id"] == "31"
     assert probe.calls == [], "a disabled switch must not even probe"
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_memsrv_list_envelope_keeps_scope_and_completeness(
+    scope: Any, truncated: bool
+) -> None:
+    envelope = {
+        "results": [
+            {
+                "id": "scoped",
+                "content": "body",
+                "metadata": {"client_application_id": "42"},
+            }
+        ],
+        "limit": 10000,
+        "truncated": truncated,
+    }
+    store = RecordingStore(_response(200, envelope))
+    if truncated:
+        with pytest.raises(RemoteMemoryStoreIncompleteError):
+            store.list_all({"category": "general"})
+    else:
+        notes = store.list_all({"category": "general"})
+        assert notes[0].id == "scoped"
+        assert notes[0].metadata["client_application_id"] == "42"
+    assert store.session.calls[0]["json"] == {
+        "filters": {"category": "general", "metadata": {"client_application_id": "42"}}
+    }

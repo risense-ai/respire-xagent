@@ -743,3 +743,50 @@ class TestMemoryApiIntegration:
         )
         # Should fail due to missing required content field
         assert response.status_code == 422
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_memsrv_envelope_through_adapter_and_web(
+    client, mock_memory_store, auth_headers, test_db, truncated
+):
+    import json
+
+    import requests
+
+    from xagent.core.memory.remote import RemoteMemoryStore
+
+    calls = []
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            calls.append({"method": method, "url": url, **kwargs})
+            response = requests.Response()
+            response.status_code = 200
+            response._content = json.dumps(
+                {
+                    "results": [
+                        {"id": "a", "content": "one"},
+                        {"id": "b", "content": "two"},
+                    ],
+                    "limit": 10000,
+                    "truncated": truncated,
+                }
+            ).encode()
+            return response
+
+    adapter = RemoteMemoryStore("http://memsrv:8080", "runtime-key", session=Session())
+    mock_memory_store.list_all.side_effect = adapter.list_all
+    response = client.get(
+        "/api/memory/list?category=general&limit=1", headers=auth_headers
+    )
+    assert calls[0]["headers"]["X-User-External-Id"] == str(test_db.id)
+    assert calls[0]["json"] == {"filters": {"category": "general"}}
+    assert len(calls) == 1
+    if truncated:
+        assert response.status_code == 503
+        assert "total_count" not in response.json()
+        assert "memories" not in response.json()
+    else:
+        assert response.status_code == 200
+        assert response.json()["total_count"] == 2
+        assert [note["id"] for note in response.json()["memories"]] == ["a"]
