@@ -1282,7 +1282,7 @@ def test_memsrv_list_envelope_keeps_scope_and_completeness(
             {
                 "id": "scoped",
                 "content": "body",
-                "metadata": {"client_application_id": "42"},
+                "metadata": {"execution_scope_client_application_id": "42"},
             }
         ],
         "limit": 10000,
@@ -1295,7 +1295,10 @@ def test_memsrv_list_envelope_keeps_scope_and_completeness(
     else:
         notes = store.list_all({"category": "general"})
         assert notes[0].id == "scoped"
-        assert notes[0].metadata["client_application_id"] == "42"
+        assert notes[0].metadata["execution_scope_client_application_id"] == "42"
     assert store.session.calls[0]["json"] == {
-        "filters": {"category": "general", "metadata": {"client_application_id": "42"}}
+        "filters": {
+            "category": "general",
+            "metadata": {"execution_scope_client_application_id": "42"},
+        }
     }
