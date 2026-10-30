@@ -54,7 +54,7 @@ import time
 from collections.abc import Mapping as AbcMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Iterator, List, Mapping, Optional, Union
 from urllib.parse import quote
@@ -166,6 +166,9 @@ class _ParentIdentityBinding:
     user_external_id: str
     service_url: str
     credential_fingerprint: str
+    invalidated: threading.Event = field(
+        default_factory=threading.Event, kw_only=True, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True)
@@ -693,6 +696,20 @@ class RemoteMemoryStore(MemoryStore):
     # ------------------------------------------------------------------
 
     def _validate_identity_binding(self, binding: _ParentIdentityBinding) -> None:
+        """An observed context/publication change permanently ends this binding.
+
+        Restoring an old configuration cannot revive a scope that already
+        failed validation. Enter a fresh scope to use a newly resolved context.
+        """
+        if binding.invalidated.is_set():
+            raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
+        try:
+            self._check_identity_binding(binding)
+        except RemoteMemoryStoreIdentityError:
+            binding.invalidated.set()
+            raise
+
+    def _check_identity_binding(self, binding: _ParentIdentityBinding) -> None:
         """Recheck the captured user/mode/config/publication before each request.
 
         Re-publication or expiry invalidates this scope even if the new mapping
