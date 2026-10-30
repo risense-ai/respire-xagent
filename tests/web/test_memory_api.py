@@ -613,7 +613,9 @@ class TestMemoryUpdateEndpoint:
         assert call_args.keywords == ["sample"]
         assert call_args.tags == ["important"]  # Original values preserved
 
-    def test_update_memory_drops_the_tag_the_new_content_replaced(self, client, mock_memory_store, auth_headers):
+    def test_update_memory_drops_the_tag_the_new_content_replaced(
+        self, client, mock_memory_store, auth_headers
+    ):
         """X-06: a content-only PUT must not keep the old plate in `tags`.
 
         The store keeps whichever tags a request carries (probed 2026-10-29),
@@ -642,13 +644,13 @@ class TestMemoryUpdateEndpoint:
         assert written.content.endswith("京A9999，停车月卡登记用。")
         assert written.tags == ["车牌号"]
 
-    def test_update_memory_honours_tags_the_caller_supplies(self, client, mock_memory_store, auth_headers):
+    def test_update_memory_honours_tags_the_caller_supplies(
+        self, client, mock_memory_store, auth_headers
+    ):
         """An explicit tag list is the caller's decision, not the client's."""
         mock_memory_store.get.return_value = Mock(
             success=True,
-            content=MemoryNote(
-                id="memory_1", content="车牌 京A8888", tags=["京A8888"]
-            ),
+            content=MemoryNote(id="memory_1", content="车牌 京A8888", tags=["京A8888"]),
         )
         mock_memory_store.update.return_value = Mock(success=True)
 
@@ -661,7 +663,9 @@ class TestMemoryUpdateEndpoint:
         assert response.status_code == 200
         assert mock_memory_store.update.call_args[0][0].tags == ["2026-10-29校正"]
 
-    def test_update_memory_clears_stale_keywords_without_tags(self, client, mock_memory_store, auth_headers):
+    def test_update_memory_clears_stale_keywords_without_tags(
+        self, client, mock_memory_store, auth_headers
+    ):
         """X-06: an empty tag list must not be refilled from old keywords.
 
         memsrv treats an empty ``tags`` list as "use keywords", so a PUT whose

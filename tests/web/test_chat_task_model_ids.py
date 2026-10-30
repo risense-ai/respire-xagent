@@ -2501,7 +2501,9 @@ def test_task_create_warns_for_a_plain_empty_seed_assistant_message_too(
     )
 
 
-def test_task_create_request_defaults_memory_threshold_to_the_distance_ceiling() -> None:
+def test_task_create_request_defaults_memory_threshold_to_the_distance_ceiling() -> (
+    None
+):
     """The task's memory search ceiling is 0.40 cosine distance (similarity >= 0.60).
 
     It used to be 1.5, which asked the service for everything up to a distance

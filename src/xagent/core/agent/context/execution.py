@@ -18,7 +18,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import tiktoken
 
-from .memory_prompts import MEMORY_PERSISTENCE_GUIDE
 from ....config import (
     get_checkpoint_gate_stall_warning_seconds,
     get_compact_threshold_ratio,
@@ -76,6 +75,7 @@ from .enrichment import (
     pending_user_response_lifecycle,
     top_level_user_request,
 )
+from .memory_prompts import MEMORY_PERSISTENCE_GUIDE
 from .memory_tool import MEMORY_TOOLS_METADATA_KEY
 from .message import LLMCallRecord, Message
 from .skill_tool import (

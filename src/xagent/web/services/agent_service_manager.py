@@ -96,13 +96,15 @@ from .memory_availability import (
 from .memory_availability import (
     MEMORY_AVAILABILITY_REASON_METADATA_KEY,
     MEMORY_AVAILABLE_METADATA_KEY,
-    public_memory_availability_reason,
 )
 from .memory_availability import (
     PUBLIC_MEMORY_AVAILABILITY_REASONS as PUBLIC_MEMORY_AVAILABILITY_REASONS,
 )
 from .memory_availability import (
     caller_facing_execution_metadata as caller_facing_execution_metadata,
+)
+from .memory_availability import (
+    public_memory_availability_reason,
 )
 from .memory_policy import (
     MemoryPolicyRequest,
