@@ -24,6 +24,7 @@ from xagent.core.agent.context.memory_tool import (
 )
 from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.lancedb import LanceDBMemoryStore
+from xagent.core.user_context import current_user_id
 from xagent.core.memory.remote import (
     RemoteMemoryStore,
     RemoteMemoryStoreAuthenticationError,
@@ -1570,8 +1571,16 @@ async def test_check_inbox_walks_the_wrapper_to_the_dedicated_surface() -> None:
     assert base.list_all_calls == []
 
 
+@pytest.fixture
+def memory_identity() -> Any:
+    """R6: remote memory I/O requires a trusted identity header."""
+    token = current_user_id.set(7)
+    yield
+    current_user_id.reset(token)
+
+
 @pytest.mark.asyncio
-async def test_check_inbox_through_the_full_production_chain() -> None:
+async def test_check_inbox_through_the_full_production_chain(memory_identity: Any) -> None:
     """Revocable(user_isolated(remote)): live reads go over the inbox routes,
     and a revoked reference fails closed instead of reaching the adapter."""
     session = _ScriptedSession(
@@ -1617,7 +1626,7 @@ async def test_check_inbox_through_the_full_production_chain() -> None:
 
 
 @pytest.mark.asyncio
-async def test_check_inbox_reaches_the_adapter_behind_a_hiding_wrapper() -> None:
+async def test_check_inbox_reaches_the_adapter_behind_a_hiding_wrapper(memory_identity: Any) -> None:
     """A wrapper without forwarding methods must not hide the capability."""
     session = _ScriptedSession(
         (
@@ -1653,7 +1662,7 @@ async def test_check_inbox_reaches_the_adapter_behind_a_hiding_wrapper() -> None
 
 
 @pytest.mark.asyncio
-async def test_check_inbox_falls_back_to_legacy_on_a_missing_inbox_route() -> None:
+async def test_check_inbox_falls_back_to_legacy_on_a_missing_inbox_route(memory_identity: Any) -> None:
     """An old service answers 404 for the inbox routes: use the legacy path."""
     session = _ScriptedSession((404, {"error": {"message": "no such route"}}))
     wrapper = _WrappedRemoteStore(
