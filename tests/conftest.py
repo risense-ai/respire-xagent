@@ -11,28 +11,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterator
 
-
-def _sanitize_no_proxy_env() -> None:
-    """Rewrite bracketed IPv6 entries in `NO_PROXY` before anything builds an httpx client.
-
-    httpx turns each `no_proxy` entry into a mount pattern (`_utils.get_environment_proxies`)
-    and a bracketed entry such as `[::1]` becomes the invalid pattern `all://*[::1]`; every
-    `httpx.Client()` then dies at import time with `Invalid port: ':1]'`. Same fix as
-    `xagent.web.__main__`, applied here so pytest collection survives the host environment.
-    """
-    for name in ("NO_PROXY", "no_proxy"):
-        raw = os.environ.get(name)
-        if not raw or "[" not in raw:
-            continue
-        os.environ[name] = ",".join(
-            part.replace("[", "").replace("]", "")
-            for part in (p.strip() for p in raw.split(","))
-            if part
-        )
-
-
-_sanitize_no_proxy_env()
-
 import pytest
 from dotenv import load_dotenv
 from openai.types.chat import ChatCompletion

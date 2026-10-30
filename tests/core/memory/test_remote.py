@@ -44,8 +44,8 @@ from xagent.core.memory.remote import (
     RemoteMemoryStoreAuthenticationError,
     RemoteMemoryStoreConfigurationError,
     RemoteMemoryStoreError,
-    RemoteMemoryStoreIncompleteError,
     RemoteMemoryStoreIdentityError,
+    RemoteMemoryStoreIncompleteError,
     delegated_agent_identity,
     explicit_memory_owner,
     registered_agent_seats,
@@ -888,9 +888,7 @@ def test_timeout_reports_an_unreachable_upstream_not_a_credential() -> None:
     assert "timed out" in text
 
 
-def test_connection_failure_reports_an_unreachable_upstream_not_a_credential() -> (
-    None
-):
+def test_connection_failure_reports_an_unreachable_upstream_not_a_credential() -> None:
     store = RecordingStore(requests.exceptions.ConnectionError("refused"))
 
     with pytest.raises(RemoteMemoryStoreError) as error:

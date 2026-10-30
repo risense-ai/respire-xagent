@@ -2009,12 +2009,12 @@ class AgentRunner:
                         "role": "system",
                         "content": (
                             "You extract durable facts from a completed exchange. "
-                            "Reply with ONE JSON object: {\"facts\": [\"...\"]}. "
+                            'Reply with ONE JSON object: {"facts": ["..."]}. '
                             "One self-contained statement per fact (project or client "
                             "names, identifiers, budgets, deadlines, schedules, "
                             "decisions and their reasons, lasting preferences, "
                             "corrections). Exclude chatter, the answer itself and "
-                            "anything transient. No durable fact? {\"facts\": []}."
+                            'anything transient. No durable fact? {"facts": []}.'
                         ),
                     },
                     {
@@ -2042,13 +2042,13 @@ class AgentRunner:
                 return
             from .context.memory_tool import StoreMemoryTool
 
-            tool = StoreMemoryTool(memory_store=memory_store, task=task, runtime=runtime)
+            tool = StoreMemoryTool(
+                memory_store=memory_store, task=task, runtime=runtime
+            )
             for fact in facts:
                 stored = await tool.execute(fact, kind="domain_insight")
                 if isinstance(stored, dict) and not stored.get("success", True):
-                    logger.warning(
-                        "single_call durable fact rejected: %s", stored
-                    )
+                    logger.warning("single_call durable fact rejected: %s", stored)
         except Exception:
             logger.exception("single_call durable-fact persistence failed")
 

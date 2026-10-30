@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Optional, Union
 
-from xagent.core.memory.in_memory import InMemoryMemoryStore
-from xagent.core.memory.lancedb import LanceDBMemoryStore
-
+from ..core.memory.in_memory import InMemoryMemoryStore
+from ..core.memory.lancedb import LanceDBMemoryStore
+from ..core.memory.remote import RemoteMemoryStore
 from .dynamic_memory_store import get_memory_store_manager
 from .revocable_memory_store import RevocableMemoryStore
 from .user_isolated_memory import UserIsolatedMemoryStore
@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 MemoryStoreType = Union[
     InMemoryMemoryStore,
     LanceDBMemoryStore,
+    RemoteMemoryStore,
     UserIsolatedMemoryStore,
     RevocableMemoryStore,
 ]

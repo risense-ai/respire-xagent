@@ -29,6 +29,7 @@ from xagent.core.agent.language import (
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
 from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
+from xagent.core.memory.core import MemoryResponse
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -36,7 +37,6 @@ from xagent.core.model.chat.tool_protocol import (
     tool_protocol_error_response,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
-from xagent.core.memory.core import MemoryResponse
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
