@@ -1378,3 +1378,25 @@ def test_degraded_bool_wrapper_keeps_the_reason(configured_remote_service: Any) 
         True,
         remote_module.READINESS_DEGRADED_REASON,
     )
+
+
+def test_readiness_recovers_after_cache_expiry(
+    configured_remote_service: Any, monkeypatch: Any
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: clock[0])
+    bad = FakeProbeSession(requests.exceptions.Timeout())
+    good = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
+    assert remote_module.remote_memory_readiness(session=bad).status == "unavailable"
+    clock[0] += remote_module.READINESS_CACHE_SECONDS + 1
+    assert remote_module.remote_memory_readiness(session=good).status == "ready"
+    assert len(good.calls) == 1

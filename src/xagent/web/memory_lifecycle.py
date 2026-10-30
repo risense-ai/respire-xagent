@@ -51,9 +51,9 @@ from ..core.memory.lancedb_maintenance import (
 )
 from ..core.memory.remote import (
     READINESS_UNAVAILABLE_REASON,
+    RemoteMemoryReadiness,
     RemoteMemoryStoreConfigurationError,
     remote_memory_readiness,
-    RemoteMemoryReadiness,
     remote_memory_store_from_config,
 )
 from ..core.memory.vector_compatibility import (

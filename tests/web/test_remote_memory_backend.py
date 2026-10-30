@@ -21,10 +21,10 @@ import pytest
 
 from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.remote import (
-    READINESS_UNAVAILABLE_REASON,
-    RemoteMemoryStore,
-    RemoteMemoryReadiness,
     READINESS_DEGRADED_REASON,
+    READINESS_UNAVAILABLE_REASON,
+    RemoteMemoryReadiness,
+    RemoteMemoryStore,
 )
 from xagent.web import dynamic_memory_store as manager_module
 from xagent.web import memory_lifecycle as lifecycle_module
@@ -336,6 +336,7 @@ def test_runtime_policy_metadata_preserves_remote_capabilities(
     monkeypatch: Any,
 ) -> None:
     from types import SimpleNamespace
+
     from xagent.core.memory.in_memory import InMemoryMemoryStore
     from xagent.web.services import agent_service_manager as runtime
 
