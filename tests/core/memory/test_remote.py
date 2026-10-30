@@ -43,6 +43,7 @@ from xagent.core.memory.remote import (
     RemoteMemoryStoreAuthenticationError,
     RemoteMemoryStoreConfigurationError,
     RemoteMemoryStoreError,
+    RemoteMemoryStoreIdentityError,
     delegated_agent_identity,
     explicit_memory_owner,
     registered_agent_seats,
@@ -89,7 +90,7 @@ class FakeSession:
 class RecordingStore(RemoteMemoryStore):
     """The adapter with a scripted fake transport."""
 
-    def __init__(self, *responses: Any, user_id: Optional[int] = None) -> None:
+    def __init__(self, *responses: Any, user_id: Optional[int] = 23) -> None:
         self.session = FakeSession(list(responses))
         super().__init__(
             SERVICE_URL,
@@ -625,7 +626,7 @@ def test_identity_header_is_sent_with_the_contextvar_user() -> None:
     assert headers["X-User-External-Id"] == "12345"
 
 
-def test_identity_header_is_absent_without_a_user() -> None:
+def test_missing_identity_is_rejected_without_http() -> None:
     session = FakeSession([_response(200, [])])
     token = current_user_id.set(None)
     try:
@@ -634,13 +635,12 @@ def test_identity_header_is_absent_without_a_user() -> None:
             SERVICE_KEY,
             session=session,  # type: ignore[arg-type]
         )
-        store.search("hello")
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("hello")
     finally:
         current_user_id.reset(token)
 
-    headers = session.calls[-1]["headers"]
-    assert headers["Authorization"] == f"Bearer {SERVICE_KEY}"
-    assert "X-User-External-Id" not in headers
+    assert session.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1048,7 +1048,9 @@ def configured_agent_seats(monkeypatch: Any) -> Any:
     monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", SERVICE_KEY)
     monkeypatch.delenv("XAGENT_MEMORY_AGENT_SEATS", raising=False)
     monkeypatch.setattr(remote_module, "_agent_seats_cache", None)
+    token = current_user_id.set(31)
     yield
+    current_user_id.reset(token)
     monkeypatch.setattr(remote_module, "_agent_seats_cache", None)
 
 
@@ -1126,7 +1128,11 @@ def test_agent_seat_probe_without_a_service_url(monkeypatch: Any) -> None:
     monkeypatch.setattr(remote_module, "_agent_seats_cache", None)
     session = FakeSession([_response(200, {"users": []})])
 
-    seats, reason = registered_agent_seats(session=session)
+    token = current_user_id.set(31)
+    try:
+        seats, reason = registered_agent_seats(session=session)
+    finally:
+        current_user_id.reset(token)
 
     assert seats is None
     assert reason == READINESS_UNCONFIGURED_REASON
@@ -1147,6 +1153,7 @@ def test_delegated_agent_identity_sets_and_resets_the_identity_header(
     )
     token = current_user_id.set(31)
     try:
+        registered_agent_seats(session=probe)
         store.search("parent identity")
         with delegated_agent_identity(7, store=store, session=probe):
             store.search("child identity")
@@ -1160,7 +1167,7 @@ def test_delegated_agent_identity_sets_and_resets_the_identity_header(
     assert len(probe.calls) == 1, "the seat probe runs once per cache window"
 
 
-def test_delegated_agent_identity_is_a_noop_for_unregistered_agents_and_other_stores(
+def test_delegated_agent_identity_rejects_unregistered_agents_and_leaves_local_stores(
     configured_agent_seats: Any,
 ) -> None:
     probe = FakeSession(
@@ -1174,7 +1181,11 @@ def test_delegated_agent_identity_is_a_noop_for_unregistered_agents_and_other_st
     )
     token = current_user_id.set(31)
     try:
-        with delegated_agent_identity(8, store=store, session=probe):
+        registered_agent_seats(session=probe)
+        with (
+            pytest.raises(RemoteMemoryStoreIdentityError),
+            delegated_agent_identity(8, store=store, session=probe),
+        ):
             store.search("unregistered agent")
         with delegated_agent_identity(7, store=object(), session=probe):
             store.search("not the remote adapter")
@@ -1182,10 +1193,10 @@ def test_delegated_agent_identity_is_a_noop_for_unregistered_agents_and_other_st
         current_user_id.reset(token)
 
     assert calls.calls[0]["headers"]["X-User-External-Id"] == "31"
-    assert calls.calls[1]["headers"]["X-User-External-Id"] == "31"
+    assert len(calls.calls) == 1
 
 
-def test_delegated_agent_identity_falls_back_when_the_probe_fails(
+def test_delegated_agent_identity_rejects_missing_mapping_without_probe(
     configured_agent_seats: Any,
 ) -> None:
     probe = FakeSession([requests.exceptions.ConnectionError("refused")])
@@ -1197,14 +1208,16 @@ def test_delegated_agent_identity_falls_back_when_the_probe_fails(
     )
     token = current_user_id.set(31)
     try:
-        with delegated_agent_identity(7, store=store, session=probe):
+        with (
+            pytest.raises(RemoteMemoryStoreIdentityError),
+            delegated_agent_identity(7, store=store, session=probe),
+        ):
             store.search("service down")
     finally:
         current_user_id.reset(token)
 
-    assert calls.calls[0]["headers"]["X-User-External-Id"] == "31", (
-        "a failed probe must never block the delegation nor invent a seat"
-    )
+    assert calls.calls == []
+    assert probe.calls == []
 
 
 def test_delegated_agent_identity_can_be_switched_off(
@@ -1229,3 +1242,113 @@ def test_delegated_agent_identity_can_be_switched_off(
 
     assert calls.calls[0]["headers"]["X-User-External-Id"] == "31"
     assert probe.calls == [], "a disabled switch must not even probe"
+
+
+@pytest.mark.parametrize("identity", [None, "", " ", "23", 0, -1, False])
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda s: s.add(_note()),
+        lambda s: s.add(_note(content="[to:bob] body")),
+        lambda s: s.add(_note(content="[share:company] body")),
+        lambda s: s.remember(_note()),
+        lambda s: s.get("id"),
+        lambda s: s.update(_note()),
+        lambda s: s.delete("id"),
+        lambda s: s.search("query"),
+        lambda s: s.list_all(),
+        lambda s: s.get_stats(),
+        lambda s: s.clear(),
+        lambda s: s.inbox_list(),
+        lambda s: s.inbox_read(["id"]),
+        lambda s: s.delete_by_scope_dimension("client_application_id", "23"),
+        lambda s: s.list_scope_dimension_values("client_application_id"),
+    ],
+)
+def test_user_operations_require_identity_without_http(
+    identity: Any, operation: Any
+) -> None:
+    store = RecordingStore(user_id=identity)
+    assert store.session.calls == []  # Construction has no I/O.
+    with pytest.raises(RemoteMemoryStoreIdentityError):
+        operation(store)
+    assert store.session.calls == []
+
+
+def test_missing_identity_cannot_borrow_cached_seats_or_override_owner(
+    configured_agent_seats: Any,
+) -> None:
+    probe = FakeSession(
+        [_response(200, {"users": [{"kind": "agent", "agent_ref": "7"}]})]
+    )
+    registered_agent_seats(session=probe)
+    token = current_user_id.set(None)
+    calls = FakeSession([])
+    store = RemoteMemoryStore(SERVICE_URL, SERVICE_KEY, session=calls)
+    try:
+        with explicit_memory_owner(99), pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("no identity")
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            registered_agent_seats(session=probe)
+        with (
+            pytest.raises(RemoteMemoryStoreIdentityError),
+            delegated_agent_identity(7, store=store, session=probe),
+        ):
+            pytest.fail("missing identity entered a seat")
+    finally:
+        current_user_id.reset(token)
+    assert calls.calls == []
+    assert len(probe.calls) == 1
+
+
+def test_seat_registry_cache_is_scoped_to_identity_and_configuration(
+    configured_agent_seats: Any, monkeypatch: Any
+) -> None:
+    probe = FakeSession(
+        [_response(200, {"users": [{"kind": "agent", "agent_ref": "7"}]})]
+    )
+    registered_agent_seats(session=probe)
+    assert registered_agent_seats(cached_only=True)[0] == frozenset({"7"})
+    token = current_user_id.set(32)
+    try:
+        assert registered_agent_seats(cached_only=True)[0] is None
+    finally:
+        current_user_id.reset(token)
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", "different")
+    assert registered_agent_seats(cached_only=True)[0] is None
+    assert len(probe.calls) == 1
+
+
+def test_independent_seat_after_denied_control_probe_never_uses_parent(
+    configured_agent_seats: Any,
+) -> None:
+    probe = FakeSession([_response(403, {})])
+    assert registered_agent_seats(session=probe)[0] is None
+    store = RecordingStore()
+    with (
+        pytest.raises(RemoteMemoryStoreIdentityError),
+        delegated_agent_identity(7, store=store, session=probe),
+    ):
+        store.search("denied mapping")
+    assert store.session.calls == []
+    assert len(probe.calls) == 1
+
+
+def test_expired_mapping_never_triggers_a_delegation_probe(
+    configured_agent_seats: Any, monkeypatch: Any
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: clock[0])
+    probe = FakeSession(
+        [_response(200, {"users": [{"kind": "agent", "agent_ref": "7"}]})]
+    )
+    registered_agent_seats(session=probe)
+    clock[0] += remote_module.AGENT_SEATS_CACHE_SECONDS + 1
+    store = RecordingStore(user_id=31)
+    with (
+        pytest.raises(RemoteMemoryStoreIdentityError),
+        delegated_agent_identity(7, store=store, session=probe),
+    ):
+        store.search("expired")
+    assert store.session.calls == []
+    assert len(probe.calls) == 1

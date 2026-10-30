@@ -170,6 +170,29 @@ class TestMemoryListEndpoint:
         # Ensure context field is not present
         assert "context" not in memory
 
+    def test_memory_identity_comes_from_jwt_and_database(
+        self, client, mock_memory_store, auth_headers, test_db
+    ):
+        from xagent.core.memory.remote import RemoteMemoryStore
+
+        captured = []
+        remote = RemoteMemoryStore("http://memsrv:8080", "runtime-key")
+
+        def read(_filters):
+            captured.append(remote._headers())
+            return []
+
+        mock_memory_store.list_all.side_effect = read
+        headers = {
+            **auth_headers,
+            "X-User-External-Id": "agent:999",
+            "X-Memory-Owner-Id": "999",
+        }
+        response = client.get("/api/memory/list", headers=headers)
+        assert response.status_code == 200
+        assert captured[0]["X-User-External-Id"] == str(test_db.id)
+        assert "X-Memory-Owner-Id" not in captured[0]
+
     def test_list_memories_with_category_filter(
         self, client, mock_memory_store, auth_headers
     ):

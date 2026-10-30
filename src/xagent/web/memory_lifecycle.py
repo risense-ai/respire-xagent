@@ -52,8 +52,10 @@ from ..core.memory.lancedb_maintenance import (
 from ..core.memory.remote import (
     READINESS_UNAVAILABLE_REASON,
     RemoteMemoryStoreConfigurationError,
+    RemoteMemoryStoreIdentityError,
     remote_memory_ready,
     remote_memory_store_from_config,
+    require_remote_memory_identity,
 )
 from ..core.memory.vector_compatibility import (
     canonical_embedding_identity,
@@ -546,6 +548,10 @@ def resolve_remote_memory_policy(
             enabled=not request.is_preview and request.agent_id is None,
             available=True,
         )
+    try:
+        require_remote_memory_identity(request.user_id)
+    except RemoteMemoryStoreIdentityError as error:
+        return MemoryPolicyDecision(enabled=False, available=False, reason=str(error))
     available, reason = remote_memory_ready()
     if not available:
         return MemoryPolicyDecision(

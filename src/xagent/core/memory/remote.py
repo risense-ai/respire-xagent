@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import logging
 import re
 import threading
@@ -135,6 +136,8 @@ READINESS_CACHE_SECONDS = 30.0
 READINESS_UNAVAILABLE_REASON = "remote_memory_unavailable"
 #: Reason reported when the remote backend is selected without a usable URL.
 READINESS_UNCONFIGURED_REASON = "remote_memory_unconfigured"
+IDENTITY_REQUIRED_REASON = "remote_memory_identity_required"
+AGENT_SEAT_REQUIRED_REASON = "remote_memory_agent_seat_required"
 
 #: The explicit-owner override of the *current* context (T14 §B1-2). It is a
 #: context variable rather than an instance attribute because one adapter
@@ -172,11 +175,10 @@ AGENT_SEATS_PROBE_TIMEOUT = (1.0, 2.0)
 AGENT_SEATS_PROBE_FAILED_REASON = "agent_seat_probe_failed"
 
 #: (monotonic time, refs or None, reason or None). ``None`` refs mean the probe
-#: failed; the delegation path then keeps the parent identity rather than
-#: guessing a seat.
-_agent_seats_cache: Optional[tuple[float, Optional[frozenset[str]], Optional[str]]] = (
-    None
-)
+#: failed; independent delegation refuses to choose an identity.
+_agent_seats_cache: (
+    tuple[float, tuple[str | None, str, str], frozenset[str] | None, str | None] | None
+) = None
 _agent_seats_cache_lock = threading.Lock()
 
 _shared_session: Optional[requests.Session] = None
@@ -200,8 +202,28 @@ class RemoteMemoryStoreAuthenticationError(RemoteMemoryStoreError):
     """The remote memory service rejected the service credentials (HTTP 401)."""
 
 
+class RemoteMemoryStoreIdentityError(RemoteMemoryStoreError):
+    """No trusted user identity or provisioned independent seat is available."""
+
+
 class RemoteMemoryStoreConfigurationError(RuntimeError):
     """The remote backend is selected but not completely configured."""
+
+
+_USE_CONTEXT_IDENTITY = object()
+
+
+def require_remote_memory_identity(user_id: Any = _USE_CONTEXT_IDENTITY) -> str:
+    """Use only the host's authenticated User.id context, preserving its mapping.
+
+    User context is established by JWT/DB authentication or the trusted runtime,
+    never by copying incoming external-id or owner headers. No I/O is allowed
+    before this guard on a user-operation path.
+    """
+    value = current_user_id.get() if user_id is _USE_CONTEXT_IDENTITY else user_id
+    if type(value) is not int or value <= 0:
+        raise RemoteMemoryStoreIdentityError(IDENTITY_REQUIRED_REASON)
+    return str(value)
 
 
 def _get_shared_session() -> requests.Session:
@@ -245,38 +267,50 @@ def registered_agent_seats(
     *,
     refresh: bool = False,
     session: Optional[requests.Session] = None,
+    cached_only: bool = False,
+    user_id: Any = _USE_CONTEXT_IDENTITY,
 ) -> tuple[Optional[frozenset[str]], Optional[str]]:
-    """Return the registered agent seats, or ``(None, reason)`` (T14 §0.2 item 6).
+    """Read the trusted user's seat registry, optionally using only a known mapping.
 
-    The xagent adapter asks the memory service which ``agents.id`` values have a
-    seat of their own before switching a delegated child's identity; anything
-    else would make an unregistered child write under a phantom identity. The
-    answer is process-wide cached for ``AGENT_SEATS_CACHE_SECONDS`` -- failures
-    included, so a down service is not hammered by every delegation.
-
-    Never raises: "could not tell" must degrade to the historical behaviour
-    (the child runs as its parent), never block a delegation.
+    Explicit refreshes are control-plane lookups and may require organization
+    privileges. Delegation uses ``cached_only=True`` and never requests those
+    privileges with a runtime key. Missing identity raises before cache or I/O.
+    Cache entries are bounded and isolated by configuration and trusted user.
     """
     global _agent_seats_cache
+    identity = require_remote_memory_identity(user_id)
     now = time.monotonic()
+    config_key = (
+        get_memory_service_url(),
+        hashlib.sha256((get_memory_service_key() or "").encode()).hexdigest(),
+        identity,
+    )
     if not refresh:
         with _agent_seats_cache_lock:
             cached = _agent_seats_cache
-        if cached is not None and now - cached[0] < AGENT_SEATS_CACHE_SECONDS:
-            return cached[1], cached[2]
-
-    seats, reason = _safe_probe_agent_seats(session)
+        if (
+            cached is not None
+            and cached[1] == config_key
+            and now - cached[0] < AGENT_SEATS_CACHE_SECONDS
+        ):
+            return cached[2], cached[3]
+    # Delegation consumes a known mapping only. It must never need org:admin
+    # on its runtime key just to choose an identity, or probe then fall back.
+    if cached_only:
+        return None, AGENT_SEAT_REQUIRED_REASON
+    seats, reason = _safe_probe_agent_seats(session, identity)
     with _agent_seats_cache_lock:
-        _agent_seats_cache = (now, seats, reason)
+        _agent_seats_cache = (now, config_key, seats, reason)
     return seats, reason
 
 
 def _safe_probe_agent_seats(
     session: Optional[requests.Session],
+    identity: str,
 ) -> tuple[Optional[frozenset[str]], Optional[str]]:
     """``_probe_agent_seats`` with its "never raises" contract enforced."""
     try:
-        return _probe_agent_seats(session)
+        return _probe_agent_seats(session, identity)
     except Exception:  # noqa: BLE001 - "could not tell" must degrade, not propagate
         logger.debug("agent seat probe raised; reporting the failure")
         return None, AGENT_SEATS_PROBE_FAILED_REASON
@@ -284,13 +318,14 @@ def _safe_probe_agent_seats(
 
 def _probe_agent_seats(
     session: Optional[requests.Session],
+    identity: str,
 ) -> tuple[Optional[frozenset[str]], Optional[str]]:
     """One ``GET /v1/org/users?kind=agent``; classify the answer.
 
     The whole probe runs under a short timeout and swallows every transport or
     payload problem into ``(None, reason)``: an unreachable service, a service
     key without ``org:admin`` (older deployments) or a malformed body all mean
-    "no seat information", which the caller treats as "keep the parent identity".
+    "no seat information", which independent mode must reject.
     """
     base_url = get_memory_service_url()
     service_key = get_memory_service_key()
@@ -307,6 +342,7 @@ def _probe_agent_seats(
             headers={
                 "Authorization": f"Bearer {service_key}",
                 "Accept": "application/json",
+                "X-User-External-Id": identity,
             },
             timeout=AGENT_SEATS_PROBE_TIMEOUT,
         )
@@ -365,6 +401,23 @@ def _unwrap_remote_store(store: Optional[Any]) -> Optional["RemoteMemoryStore"]:
     return None
 
 
+def require_delegated_memory_identity(
+    agent_id: Optional[int],
+    *,
+    user_id: Any = _USE_CONTEXT_IDENTITY,
+) -> str:
+    """Resolve a known identity locally before any readiness or data request."""
+    identity = require_remote_memory_identity(user_id)
+    if not get_memory_agent_seats_enabled():
+        return identity
+    if type(agent_id) is not int or agent_id <= 0:
+        raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
+    seats, reason = registered_agent_seats(cached_only=True, user_id=user_id)
+    if not seats or str(agent_id) not in seats:
+        raise RemoteMemoryStoreIdentityError(reason or AGENT_SEAT_REQUIRED_REASON)
+    return f"agent:{agent_id}"
+
+
 @contextmanager
 def delegated_agent_identity(
     agent_id: Optional[int],
@@ -373,38 +426,27 @@ def delegated_agent_identity(
     refresh: bool = False,
     session: Optional[requests.Session] = None,
 ) -> Iterator[None]:
-    """Run the block under ``agent_id``'s own seat, when it has one (T14 §0.2).
+    """Select an independent seat from an already known registry mapping.
 
-    The switch engages only when ``store`` reaches the remote adapter -- the
-    only backend with an identity to switch, and the only one whose calls reach
-    the service that holds the seats -- and the target agent is registered as a
-    seat there (``agent_ref`` = the agent id). ``store`` may be the bare
-    adapter or the wrapped process-published store; wrappers are unwrapped
-    first. Every other case -- the switch disabled, a local or missing store,
-    an unregistered agent, a failed probe -- is a no-op, so a delegation is
-    never blocked nor pointed at a phantom identity. The override is reset
-    even when the block raises.
+    Independent mode rejects missing/expired mappings before HTTP. Explicit
+    parent mode (the switch disabled) retains the authenticated parent's id.
+    Local stores are unaffected. The override always resets on exit.
     """
-    if agent_id is None or not get_memory_agent_seats_enabled():
+    remote_store = _unwrap_remote_store(store)
+    if remote_store is None:
         yield
         return
-    if _unwrap_remote_store(store) is None:
-        yield
-        return
-    try:
-        ref = str(int(agent_id))
-    except (TypeError, ValueError):
-        yield
-        return
-    try:
-        seats, _reason = registered_agent_seats(refresh=refresh, session=session)
-    except Exception:  # noqa: BLE001 - a probe hiccup must never block a delegation
-        logger.debug("agent seat probe raised; keeping the parent identity")
-        seats = None
-    if not seats or ref not in seats:
-        yield
-        return
-    token = _agent_identity_override.set(f"agent:{ref}")
+    if get_memory_agent_seats_enabled() and (
+        remote_store._base_url != (get_memory_service_url() or "").rstrip("/")
+        or remote_store._service_key != get_memory_service_key()
+    ):
+        raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
+    identity = require_delegated_memory_identity(
+        agent_id, user_id=remote_store._user_id_provider()
+    )
+    token = _agent_identity_override.set(
+        identity if identity.startswith("agent:") else None
+    )
     try:
         yield
     finally:
@@ -636,21 +678,16 @@ class RemoteMemoryStore(MemoryStore):
         The service key authenticates the process; ``X-User-External-Id``
         carries the acting xagent user so the service can resolve ownership.
         Inside :func:`delegated_agent_identity` the header carries the seat
-        identity (``agent:<ref>``) instead (T14 §0.2 item 6). A missing user id
-        is deliberately sent as nothing at all: the service must answer 401
-        rather than be handed an anonymous identity.
+        identity (``agent:<ref>``) instead. A missing trusted user id raises
+        before any HTTP, including when a seat override exists.
         """
         headers = {
             "Authorization": f"Bearer {self._service_key}",
             "Content-Type": "application/json",
         }
+        identity = require_remote_memory_identity(self._user_id_provider())
         agent_identity = _agent_identity_override.get()
-        if agent_identity is not None:
-            headers["X-User-External-Id"] = agent_identity
-        else:
-            user_id = self._user_id_provider()
-            if user_id is not None:
-                headers["X-User-External-Id"] = str(user_id)
+        headers["X-User-External-Id"] = agent_identity or identity
         explicit_owner = _explicit_owner_override.get()
         if explicit_owner is not None:
             headers[OWNER_HEADER] = str(explicit_owner)
@@ -1227,6 +1264,8 @@ __all__ = [
     "RemoteMemoryStoreAuthenticationError",
     "RemoteMemoryStoreConfigurationError",
     "RemoteMemoryStoreError",
+    "RemoteMemoryStoreIdentityError",
+    "require_remote_memory_identity",
     "WRITE_TIMEOUT_SECONDS",
     "explicit_memory_owner",
     "remote_memory_ready",

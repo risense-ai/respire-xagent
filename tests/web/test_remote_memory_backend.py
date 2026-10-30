@@ -278,3 +278,25 @@ def test_revocable_store_reports_an_unsupported_judged_write() -> None:
 
     with pytest.raises(AttributeError):
         store.remember(MemoryNote(content="a durable fact"))
+
+
+@pytest.mark.parametrize("identity", [None, 0, "", " "])
+def test_policy_missing_identity_does_not_probe(
+    monkeypatch: Any, identity: Any
+) -> None:
+    from dataclasses import replace
+
+    from xagent.core.memory.remote import IDENTITY_REQUIRED_REASON
+
+    _select_remote(monkeypatch)
+    monkeypatch.setattr(
+        lifecycle_module,
+        "remote_memory_ready",
+        lambda: pytest.fail("identity must precede readyz"),
+    )
+    decision = lifecycle_module.resolve_remote_memory_policy(
+        replace(_policy_request(), user_id=identity)
+    )
+    assert decision == MemoryPolicyDecision(
+        enabled=False, available=False, reason=IDENTITY_REQUIRED_REASON
+    )
