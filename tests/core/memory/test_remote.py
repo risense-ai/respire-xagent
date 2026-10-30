@@ -43,6 +43,7 @@ from xagent.core.memory.remote import (
     RemoteMemoryStoreAuthenticationError,
     RemoteMemoryStoreConfigurationError,
     RemoteMemoryStoreError,
+    RemoteMemoryStoreIncompleteError,
     delegated_agent_identity,
     explicit_memory_owner,
     registered_agent_seats,
@@ -444,7 +445,9 @@ def test_search_empty_array_is_a_real_empty_result() -> None:
 
 
 def test_list_all_posts_filters() -> None:
-    store = RecordingStore(_response(200, {"memories": [{"id": "n1", "content": "x"}]}))
+    store = RecordingStore(
+        _response(200, {"memories": [{"id": "n1", "content": "x"}], "truncated": False})
+    )
 
     notes = store.list_all({"category": "general"})
 
@@ -453,6 +456,45 @@ def test_list_all_posts_filters() -> None:
     assert call["method"] == "POST"
     assert call["url"] == f"{SERVICE_URL}/v1/memory/list"
     assert call["json"] == {"filters": {"category": "general"}}
+
+
+@pytest.mark.parametrize("count", [0, 9999, 10000, 10001])
+@pytest.mark.parametrize("filters", [None, {"category": "general"}])
+def test_list_all_requires_complete_results(count: int, filters: Any) -> None:
+    items = [{"id": str(i), "content": "x"} for i in range(min(count, 10000))]
+    store = RecordingStore(_response(200, {"notes": items, "truncated": count > 10000}))
+    if count > 10000:
+        with pytest.raises(RemoteMemoryStoreIncompleteError):
+            store.list_all(filters)
+    else:
+        assert len(store.list_all(filters)) == count
+    assert len(store.session.calls) == 1
+    assert store.session.calls[0]["json"] == {"filters": filters}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"notes": []},
+        {"notes": [], "truncated": 0},
+        {"notes": [], "truncated": "false"},
+        {"notes": [], "truncated": None},
+    ],
+)
+def test_list_all_rejects_unknown_completeness(payload: Any) -> None:
+    store = RecordingStore(_response(200, payload))
+    with pytest.raises(RemoteMemoryStoreError, match="completeness flag"):
+        store.list_all()
+
+
+def test_bounded_search_and_inbox_keep_their_envelope_contract() -> None:
+    store = RecordingStore(
+        _response(200, {"notes": [{"id": "a"}], "truncated": True}),
+        _response(200, {"notes": [{"id": "b"}]}),
+    )
+    assert [note.id for note in store.search("query")] == ["a"]
+    assert [note.id for note in store.inbox_list()] == ["b"]
 
 
 def test_get_stats_normalizes_the_contract_keys() -> None:

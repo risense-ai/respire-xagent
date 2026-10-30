@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.remote import RemoteMemoryStoreIncompleteError
 from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.api.memory import MemoryManagementRouter
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
@@ -293,6 +294,17 @@ class TestMemoryListEndpoint:
         assert response.status_code == 200
         assert response.json()["memories"] == []
         assert response.json()["total_count"] == 0
+
+    def test_incomplete_remote_list_never_reports_a_total(
+        self, client, mock_memory_store, auth_headers
+    ):
+        mock_memory_store.list_all.side_effect = RemoteMemoryStoreIncompleteError(
+            "Remote memory list is incomplete"
+        )
+        response = client.get("/api/memory/list?limit=5", headers=auth_headers)
+        assert response.status_code == 503
+        assert "total_count" not in response.json()
+        assert "memories" not in response.json()
 
     def test_search_memories_sanitizes_backend_failure(
         self, client, mock_memory_store, auth_headers
