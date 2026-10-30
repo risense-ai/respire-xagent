@@ -313,14 +313,14 @@ def test_get_denied_returns_the_local_denial_message(status: int) -> None:
     assert response.memory_id == "note-1"
 
 
-def test_update_puts_the_note() -> None:
-    store = RecordingStore(_response(200, {"id": "note-1"}))
+def test_update_patches_only_editable_fields() -> None:
+    store = RecordingStore(_response(200, {"id": "note-1", "success": True}))
 
     response = store.update(_note())
 
     assert response.success is True
     call = store.session.calls[-1]
-    assert call["method"] == "PUT"
+    assert call["method"] == "PATCH"
     assert call["url"] == f"{SERVICE_URL}/v1/memory/notes/note-1"
     assert call["json"]["content"] == "hello"
 
@@ -894,7 +894,7 @@ def test_delivery_authentication_failure_raises_authentication_error() -> None:
 
 
 def test_update_sends_the_explicit_owner_header() -> None:
-    store = RecordingStore(_response(200, {"id": "note-1"}))
+    store = RecordingStore(_response(200, {"id": "note-1", "success": True}))
 
     store.update(_note(), owner_id=42)
 
@@ -903,7 +903,7 @@ def test_update_sends_the_explicit_owner_header() -> None:
 
 
 def test_update_without_an_explicit_owner_sends_no_owner_header() -> None:
-    store = RecordingStore(_response(200, {"id": "note-1"}))
+    store = RecordingStore(_response(200, {"id": "note-1", "success": True}))
 
     store.update(_note())
 
@@ -1448,3 +1448,125 @@ def test_memsrv_list_envelope_keeps_scope_and_completeness(
             "metadata": {"execution_scope_client_application_id": "42"},
         }
     }
+
+
+def test_patch_payload_omits_identity_structure_and_unset_defaults() -> None:
+    store = RecordingStore(_response(200, {"id": "n", "success": True}))
+    response = store.update(MemoryNote(id="n", content="edited"))
+    assert response.success
+    assert store.session.calls[0]["json"] == {"content": "edited"}
+    assert [call["method"] for call in store.session.calls] == ["PATCH"]
+
+
+def test_patch_metadata_keeps_protected_values_for_server_validation() -> None:
+    metadata = {
+        "user_id": "31",
+        "execution_scope_agent": 10,
+        "parent_id": "root",
+        "delivery_id": "immutable",
+        "respire_key": "fixed",
+        "business": "new",
+    }
+    store = RecordingStore(_response(200, {"id": "note-1", "success": True}))
+    store.update(_note(metadata=metadata, space_kind="company", space_id=8))
+    body = store.session.calls[0]["json"]
+    assert body["metadata"] == metadata
+    assert set(body) <= {
+        "content",
+        "content_b64",
+        "keywords",
+        "tags",
+        "category",
+        "timestamp",
+        "mime_type",
+        "metadata",
+    }
+    assert metadata["user_id"] == "31"
+
+
+def test_patch_explicit_empty_fields_clear_and_inplace_defaults_are_included() -> None:
+    note = MemoryNote(id="n", content="edited", keywords=[], tags=[], metadata={})
+    assert RemoteMemoryStore._note_patch_payload(note) == {
+        "content": "edited",
+        "keywords": [],
+        "tags": [],
+        "metadata": {},
+    }
+    note = MemoryNote(id="n", content="edited")
+    note.tags.append("new")
+    note.metadata["business"] = "new"
+    assert RemoteMemoryStore._note_patch_payload(note) == {
+        "content": "edited",
+        "tags": ["new"],
+        "metadata": {"business": "new"},
+    }
+
+
+@pytest.mark.parametrize("binary", [b"", b"\x00\xff"])
+def test_patch_binary_payload_and_readback(binary: bytes) -> None:
+    wire = base64.b64encode(binary).decode()
+    store = RecordingStore(
+        _response(200, {"id": "n", "success": True}),
+        _response(200, {"id": "n", "content": None, "content_b64": wire}),
+    )
+    assert store.update(MemoryNote(id="n", content=binary)).success
+    assert store.session.calls[0]["json"] == {"content_b64": wire}
+    assert store.get("n").content.content == binary
+
+
+@pytest.mark.parametrize("status", [400, 401, 404, 405, 409, 500])
+def test_patch_failures_never_fall_back_to_put(status: int) -> None:
+    store = RecordingStore(_response(status, {}))
+    if status == 404:
+        assert not store.update(_note()).success
+    else:
+        with pytest.raises(RemoteMemoryStoreError):
+            store.update(_note())
+    assert [call["method"] for call in store.session.calls] == ["PATCH"]
+
+
+@pytest.mark.parametrize(
+    "reply", [{}, {"id": "n", "success": False}, {"id": "other", "success": True}]
+)
+def test_patch_requires_successful_matching_acknowledgement(reply: Any) -> None:
+    store = RecordingStore(_response(200, reply))
+    with pytest.raises(RemoteMemoryStoreError, match="acknowledgement"):
+        store.update(MemoryNote(id="n", content="body"))
+    assert len(store.session.calls) == 1
+
+
+def test_patch_ack_is_summary_not_a_complete_note() -> None:
+    reply = {
+        "id": "n",
+        "success": True,
+        "owner_id": 1,
+        "space_kind": None,
+        "space_id": None,
+        "modified_by": {"user_id": 1},
+        "degraded": True,
+    }
+    store = RecordingStore(_response(200, reply))
+    result = store.update(MemoryNote(id="n", content="body"))
+    assert result.success and result.content is None
+    assert result.metadata == {
+        key: value for key, value in reply.items() if key not in {"id", "success"}
+    }
+
+
+def test_patch_scope_check_does_not_backfill_parent_or_path(scope: Any) -> None:
+    store = RecordingStore(
+        _response(
+            200,
+            {
+                "id": "n",
+                "content": "old",
+                "parent_id": "root",
+                "path": "root/",
+                "metadata": {"execution_scope_client_application_id": "42"},
+            },
+        ),
+        _response(200, {"id": "n", "success": True}),
+    )
+    assert store.update(MemoryNote(id="n", content="edited")).success
+    assert [call["method"] for call in store.session.calls] == ["GET", "PATCH"]
+    assert store.session.calls[-1]["json"] == {"content": "edited"}
