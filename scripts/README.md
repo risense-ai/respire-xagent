@@ -3,6 +3,15 @@
 Operational helper scripts for local development, upgrades, and release checks.
 Run commands from the repository root unless a script says otherwise.
 
+## `live_memory_roundtrip.py`
+
+Drives the remote-memory adapter against a running memsrv and reports which
+memory surfaces the service supports (health, readiness, identity, add/get/
+search/list/update/delete). Exit code 0 means every required path passed.
+See [live memory test](../docs/live-memory-test.md) for the runbook and the
+two known service-side gaps it currently reports (missing PATCH, refused user
+deletion).
+
 ## `parallel_search_example.py`
 
 Runs opt-in, keyless web search and optional page fetching through Xagent's
