@@ -211,9 +211,10 @@ def _record_upstream_answer(path: str, response: requests.Response) -> None:
     payload: Any
     try:
         payload = response.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         payload = None
     error = ((payload or {}).get("error") or {}) if isinstance(payload, dict) else {}
+    error = error if isinstance(error, dict) else {}
     now = time.time()
     with _upstream_health_lock:
         _upstream_health["last_event_at"] = now
@@ -1084,6 +1085,12 @@ class RemoteMemoryStore(MemoryStore):
                 f"Remote memory upstream unreachable (connection failure -- not "
                 f"a credential rejection): {method} {path} — {error}"
             ) from error
+        if response.status_code == 401:
+            binding = _agent_identity_override.get()
+            if isinstance(binding, _AGENT_BINDING_TYPES):
+                # Fence before response instrumentation can inspect an invalid
+                # body. A malformed rejection cannot leave the old scope live.
+                binding.invalidated.set()
         _record_upstream_answer(path, response)
         return response
 
@@ -1099,9 +1106,10 @@ class RemoteMemoryStore(MemoryStore):
     def _raise_for_error(self, path: str, response: requests.Response) -> None:
         """Raise unless the service answered with a 2xx (§3.5.1).
 
-        A 401 is *classified* instead of being blamed on the credential by
-        default (缺陷一). The upstream answers a bad key, a revoked key and an
-        unknown ``X-User-External-Id`` with the very same generic
+        Independent scopes are permanently fenced on 401, without diagnostic
+        identity switching. Other 401s are classified instead of blaming the
+        credential by default (缺陷一). The upstream answers a bad key,
+        revoked key and unknown ``X-User-External-Id`` with the same generic
         ``{"error":{"code":"unauthorized","message":"unauthorized"}}`` body
         (Go ``internal/app/identity/service.go:28``), so the raised text is
         decided from observable evidence: credential wording in the upstream
@@ -1112,20 +1120,39 @@ class RemoteMemoryStore(MemoryStore):
         status = response.status_code
         if 200 <= status < 300:
             return
+        binding = _agent_identity_override.get()
+        independent_rejected = status == 401 and isinstance(
+            binding, _AGENT_BINDING_TYPES
+        )
+        if independent_rejected:
+            # A selected identity/key has been rejected. Fence before parsing
+            # the response, and do not retry or diagnose under a bare identity.
+            assert binding is not None
+            binding.invalidated.set()
         # the service's own message carries the repair ("send a follow-up delivery
         # instead" for a 409) — dropping it left the model retrying blind
         code: Optional[str] = None
         message = ""
         try:
             payload = response.json()
-            error = (payload or {}).get("error") or {}
+            error = payload.get("error") if isinstance(payload, dict) else None
+            error = error if isinstance(error, dict) else {}
             if isinstance(error.get("code"), str):
                 code = error["code"]
             if isinstance(error.get("message"), str):
                 message = error["message"]
-        except ValueError:
+        except (ValueError, RecursionError):
             pass
         if status == 401:
+            if independent_rejected:
+                code_note = f"（code={code}）" if code else ""
+                message_note = f"，上游 message: {message}" if message else ""
+                raise RemoteMemoryStoreAuthenticationError(
+                    f"上游拒绝了当前独立身份或凭据：HTTP 401{code_note} on "
+                    f"{path}{message_note}。当前记忆 scope 已失效；"
+                    "请核对上游身份/凭据，并重新进入独立 scope。",
+                    status_code=status,
+                )
             raise RemoteMemoryStoreAuthenticationError(
                 self._classify_401(path, code, message),
                 status_code=status,

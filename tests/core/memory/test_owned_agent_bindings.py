@@ -21,6 +21,8 @@ from xagent.core.memory import agent_seats
 from xagent.core.memory.agent_bindings import approved_bindings
 from xagent.core.memory.remote import (
     RemoteMemoryStore,
+    RemoteMemoryStoreAuthenticationError,
+    RemoteMemoryStoreError,
     RemoteMemoryStoreIdentityError,
     delegated_agent_identity,
 )
@@ -71,7 +73,7 @@ def owned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         payload: dict[str, Any]
         if url.endswith("/v1/whoami"):
             response.status_code = state["status"]
-            identity = kwargs["headers"]["X-User-External-Id"]
+            identity = kwargs["headers"].get("X-User-External-Id", "31")
             payload = {
                 "scopes": ["memory:read", "memory:write"],
                 "identity": {
@@ -79,7 +81,12 @@ def owned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
                 },
             }
         else:
+            response.status_code = state.get("data_status", 200)
             payload = {"results": [], "truncated": False}
+            if response.status_code == 401:
+                payload = {"error": {"code": "unauthorized", "message": "unauthorized"}}
+                if state.get("malformed_error"):
+                    payload = {"error": ["unexpected shape"]}
         response._content = json.dumps(payload).encode()
         return response
 
@@ -111,6 +118,65 @@ def test_owned_configured_agent_keeps_independent_identity_without_provider(
     assert not any("/org/" in call["url"] for call in calls)
     store.search("ordinary user after scope")
     assert calls[-1]["headers"]["X-User-External-Id"] == "31"
+
+
+@pytest.mark.parametrize("configured", [True, False])
+@pytest.mark.parametrize("malformed_error", [True, False])
+def test_authentication_failure_permanently_fences_independent_scope(
+    owned: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: bool,
+    malformed_error: bool,
+) -> None:
+    engine, _record, state, calls, store, check = owned
+    if not configured:
+        monkeypatch.delenv("XAGENT_MEMORY_AGENT_BINDINGS")
+        registry = agent_seats.TrustedAgentSeatRegistry()
+        registry.publish(
+            service_url=URL,
+            user_id=31,
+            runtime_profile=PROFILE,
+            agent_ids=[7],
+            ttl_seconds=60,
+            status="active",
+        )
+        monkeypatch.setattr(agent_seats, "_provider", registry)
+    with delegated_agent_identity(7, store=store, owner_check=check):
+        store.search("before remote identity rejection")
+        answered = len(calls)
+        state.update(data_status=401, malformed_error=malformed_error)
+        with pytest.raises(RemoteMemoryStoreAuthenticationError) as rejected:
+            store.search("identity disabled remotely")
+        assert rejected.value.status_code == 401
+        state["data_status"] = 200
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("restored identity cannot revive old scope")
+        assert len(calls) == answered + 1  # no bare-key diagnostic or retry
+
+        fresh = _agent_memory_ownership_check(31, 7, sessionmaker(bind=engine))
+        with delegated_agent_identity(7, store=store, owner_check=fresh):
+            store.search("explicit new scope after recovery")
+        recovered = len(calls)
+        assert recovered > answered + 1
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("fresh nested scope does not revive old scope")
+        assert len(calls) == recovered
+
+
+def test_business_permission_denial_does_not_invalidate_identity_scope(
+    owned: Any,
+) -> None:
+    _engine, _record, state, calls, store, check = owned
+    with delegated_agent_identity(7, store=store, owner_check=check):
+        state["data_status"] = 403
+        with pytest.raises(RemoteMemoryStoreError) as denied:
+            store.search("resource forbidden")
+        assert denied.value.status_code == 403
+        assert not isinstance(denied.value, RemoteMemoryStoreAuthenticationError)
+        answered = len(calls)
+        state["data_status"] = 200
+        store.search("another permitted operation in the same identity scope")
+        assert len(calls) == answered + 1
 
 
 def test_team_execution_permission_is_not_personal_memory_ownership(owned: Any) -> None:
