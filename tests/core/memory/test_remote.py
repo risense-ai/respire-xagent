@@ -1433,7 +1433,16 @@ def configured_remote_service(monkeypatch: Any) -> Any:
 def test_readiness_probe_reports_a_ready_service(
     configured_remote_service: Any,
 ) -> None:
-    session = FakeProbeSession(_response(200, {"status": "ok"}))
+    session = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
 
     available, reason = remote_memory_ready(session=session)
 
@@ -1473,7 +1482,16 @@ def test_readiness_probe_reports_the_reason_without_a_service_url(
 ) -> None:
     monkeypatch.delenv("XAGENT_MEMORY_SERVICE_URL", raising=False)
     monkeypatch.setattr(remote_module, "_readiness_cache", None)
-    session = FakeProbeSession(_response(200, {"status": "ok"}))
+    session = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
 
     available, reason = remote_memory_ready(session=session)
 
@@ -1485,7 +1503,16 @@ def test_readiness_probe_reports_the_reason_without_a_service_url(
 def test_readiness_answer_is_cached_until_refreshed(
     configured_remote_service: Any,
 ) -> None:
-    ready = FakeProbeSession(_response(200, {"status": "ok"}))
+    ready = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
     failing = FakeProbeSession(requests.exceptions.ConnectionError("refused"))
 
     assert remote_memory_ready(session=ready) == (True, None)
@@ -1727,3 +1754,147 @@ def test_memsrv_list_envelope_keeps_scope_and_completeness(
             "metadata": {"execution_scope_client_application_id": "42"},
         }
     }
+
+
+@pytest.mark.parametrize(
+    ("code", "body", "expected", "semantic"),
+    [
+        (
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+            "ready",
+            True,
+        ),
+        (
+            200,
+            {
+                "status": "degraded",
+                "db": "ok",
+                "embedding": {"status": "degraded", "degraded": True},
+            },
+            "degraded",
+            False,
+        ),
+        (
+            200,
+            {
+                "status": "unavailable",
+                "db": "error",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+            "unavailable",
+            False,
+        ),
+        (200, {}, "protocol_error", False),
+        (200, [], "protocol_error", False),
+        (200, {"status": [], "db": "ok", "embedding": {}}, "protocol_error", False),
+        (
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": "false"},
+            },
+            "protocol_error",
+            False,
+        ),
+        (
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "degraded", "degraded": True},
+            },
+            "protocol_error",
+            False,
+        ),
+        (204, {}, "protocol_error", False),
+        (503, {}, "unavailable", False),
+    ],
+)
+def test_readiness_dependency_contract(
+    configured_remote_service: Any, code: int, body: Any, expected: str, semantic: bool
+) -> None:
+    result = remote_module.remote_memory_readiness(
+        session=FakeProbeSession(_response(code, body))
+    )
+    assert result.status == expected
+    assert result.semantic_available is semantic
+    assert result.available is (expected in {"ready", "degraded"})
+
+
+def test_readiness_malformed_json_is_protocol_error(
+    configured_remote_service: Any,
+) -> None:
+    result = remote_module.remote_memory_readiness(
+        session=FakeProbeSession(_response(200, raw="<html>"))
+    )
+    assert result.status == "protocol_error"
+
+
+def test_readiness_shared_cache_recovery_and_config_invalidation(
+    configured_remote_service: Any, monkeypatch: Any
+) -> None:
+    good = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
+    bad = FakeProbeSession(requests.exceptions.Timeout())
+    assert remote_memory_ready(session=bad)[0] is False
+    assert remote_module.remote_memory_readiness(session=good).status == "unavailable"
+    assert good.calls == []
+    assert remote_memory_ready(session=good, refresh=True) == (True, None)
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", "changed-key")
+    assert remote_module.remote_memory_readiness(session=bad).status == "unavailable"
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", "http://replacement:8080")
+    assert remote_module.remote_memory_readiness(session=good).status == "ready"
+    assert good.calls[-1]["url"] == "http://replacement:8080/readyz"
+
+
+def test_degraded_bool_wrapper_keeps_the_reason(configured_remote_service: Any) -> None:
+    session = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "degraded",
+                "db": "ok",
+                "embedding": {"status": "degraded", "degraded": True},
+            },
+        )
+    )
+    assert remote_memory_ready(session=session) == (
+        True,
+        remote_module.READINESS_DEGRADED_REASON,
+    )
+
+
+def test_readiness_recovers_after_cache_expiry(
+    configured_remote_service: Any, monkeypatch: Any
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: clock[0])
+    bad = FakeProbeSession(requests.exceptions.Timeout())
+    good = FakeProbeSession(
+        _response(
+            200,
+            {
+                "status": "ok",
+                "db": "ok",
+                "embedding": {"status": "ok", "degraded": False},
+            },
+        )
+    )
+    assert remote_module.remote_memory_readiness(session=bad).status == "unavailable"
+    clock[0] += remote_module.READINESS_CACHE_SECONDS + 1
+    assert remote_module.remote_memory_readiness(session=good).status == "ready"
+    assert len(good.calls) == 1

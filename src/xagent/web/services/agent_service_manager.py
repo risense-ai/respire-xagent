@@ -96,15 +96,13 @@ from .memory_availability import (
 from .memory_availability import (
     MEMORY_AVAILABILITY_REASON_METADATA_KEY,
     MEMORY_AVAILABLE_METADATA_KEY,
+    public_memory_availability_reason,
 )
 from .memory_availability import (
     PUBLIC_MEMORY_AVAILABILITY_REASONS as PUBLIC_MEMORY_AVAILABILITY_REASONS,
 )
 from .memory_availability import (
     caller_facing_execution_metadata as caller_facing_execution_metadata,
-)
-from .memory_availability import (
-    public_memory_availability_reason,
 )
 from .memory_policy import (
     MemoryPolicyRequest,
@@ -230,6 +228,8 @@ class AgentServiceMemoryPolicy:
     memory_enabled: bool
     memory_available: bool = True
     memory_availability_reason: str | None = None
+    memory_remote_status: str | None = None
+    memory_semantic_available: bool | None = None
 
     @property
     def public_availability_reason(self) -> str | None:
@@ -245,12 +245,19 @@ class AgentServiceMemoryPolicy:
         be folded before persistence. The raw reason remains available on this
         policy object for operator logging only.
         """
-        if self.memory_available:
-            return {}
-        return {
-            MEMORY_AVAILABLE_METADATA_KEY: False,
-            MEMORY_AVAILABILITY_REASON_METADATA_KEY: self.public_availability_reason,
-        }
+        metadata: dict[str, Any] = {}
+        if self.memory_remote_status is not None:
+            metadata["memory_remote_status"] = self.memory_remote_status
+        if self.memory_semantic_available is not None:
+            metadata["memory_semantic_available"] = self.memory_semantic_available
+        if not self.memory_available:
+            metadata.update(
+                {
+                    MEMORY_AVAILABLE_METADATA_KEY: False,
+                    MEMORY_AVAILABILITY_REASON_METADATA_KEY: self.public_availability_reason,
+                }
+            )
+        return metadata
 
 
 def _optional_task_int(task: Any, field: str) -> int | None:
@@ -298,6 +305,10 @@ def resolve_agent_service_memory_policy(
             memory_enabled=enabled,
             memory_available=True if override is None else override.available,
             memory_availability_reason=None if override is None else override.reason,
+            memory_remote_status=None if override is None else override.remote_status,
+            memory_semantic_available=None
+            if override is None
+            else override.semantic_available,
         )
 
     try:
@@ -323,6 +334,10 @@ def resolve_agent_service_memory_policy(
         memory_enabled=enabled,
         memory_available=True if override is None else override.available,
         memory_availability_reason=None if override is None else override.reason,
+        memory_remote_status=None if override is None else override.remote_status,
+        memory_semantic_available=None
+        if override is None
+        else override.semantic_available,
     )
 
 

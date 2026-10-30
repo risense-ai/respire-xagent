@@ -50,9 +50,9 @@ from ..core.memory.lancedb_maintenance import (
     validate_lock_timeout,
 )
 from ..core.memory.remote import (
-    READINESS_UNAVAILABLE_REASON,
+    RemoteMemoryReadiness,
     RemoteMemoryStoreConfigurationError,
-    remote_memory_ready,
+    remote_memory_readiness,
     remote_memory_store_from_config,
 )
 from ..core.memory.vector_compatibility import (
@@ -200,6 +200,8 @@ class MemoryLifecycleStatus:
     state: MemoryLifecycleState
     mode: Optional[MemoryStorageMode] = None
     vector_search: bool = False
+    remote_status: str | None = None
+    reason: str | None = None
 
     @property
     def detail(self) -> str:
@@ -358,8 +360,7 @@ def remote_admission_result() -> Optional[AdmissionResult]:
     return AdmissionResult(
         MemoryLifecycleStatus(
             MemoryLifecycleState.READY,
-            mode=MemoryStorageMode.VECTOR,
-            vector_search=True,
+            remote_status="unknown",
         ),
         store=store,
         vector_space_fingerprint=None,
@@ -522,43 +523,49 @@ def credential_failure_result() -> AdmissionResult:
 def resolve_remote_memory_policy(
     request: MemoryPolicyRequest,
 ) -> MemoryPolicyDecision:
-    """Trusted memory policy for the tasks the native rule leaves closed.
+    """Use dependency health for remote tasks, preserving degraded storage.
 
-    Native xagent disables memory for every task bound to an ``agent_id``
-    (``agent_service_manager.resolve_agent_service_memory_policy``), and the
-    only native switch is this host hook. Delegated, posted and
-    agent-addressed work is exactly that case, and on the remote backend --
-    which owns the shared space and the access control -- those tasks run with
-    memory enabled.
-
-    Every other request gets a decision that reproduces the native rule
-    exactly (``enabled = not preview and no agent_id``, availability left to
-    the published-store path): a registered resolver must always answer -- the
-    hook treats a ``None`` return as a failure -- and a resolver that decided
-    for ordinary tasks would change behaviour it was not asked to change.
-
-    For the tasks it does decide, availability is the service's own ``/readyz``
-    answer, cached per process. An unavailable service yields ``enabled=False``
-    as well: the policy is validated fail-closed, and a task must not be handed
-    memory tools that can only fail.
+    Preview and local-backend tasks retain the native enablement rule. Remote
+    tasks share the structured health cache with lifecycle reporting; storage
+    availability and semantic capability are distinct. The trusted caller must
+    establish identity before consulting this health probe.
     """
-    if (
-        get_memory_backend() != "remote"
-        or request.is_preview
-        or request.agent_id is None
-    ):
+    if get_memory_backend() != "remote" or request.is_preview:
         return MemoryPolicyDecision(
             enabled=not request.is_preview and request.agent_id is None,
             available=True,
         )
-    available, reason = remote_memory_ready()
-    if not available:
-        return MemoryPolicyDecision(
-            enabled=False,
-            available=False,
-            reason=reason or READINESS_UNAVAILABLE_REASON,
+    health = remote_memory_readiness()
+    return MemoryPolicyDecision(
+        enabled=health.available,
+        available=health.available,
+        reason=health.reason,
+        remote_status=health.status,
+        semantic_available=health.semantic_available,
+    )
+
+
+def remote_lifecycle_status(health: RemoteMemoryReadiness) -> MemoryLifecycleStatus:
+    """Describe a health snapshot without revoking the configured adapter.
+
+    Remote failures recover through subsequent probes, unlike local storage
+    admission failures that require operator action or a restart.
+    """
+    return MemoryLifecycleStatus(
+        MemoryLifecycleState.READY
+        if health.available
+        else MemoryLifecycleState.RETRYABLE_UNAVAILABLE,
+        mode=(
+            MemoryStorageMode.VECTOR
+            if health.semantic_available
+            else MemoryStorageMode.TEXT_ONLY
         )
-    return MemoryPolicyDecision(enabled=True, available=True)
+        if health.available
+        else None,
+        vector_search=health.semantic_available,
+        remote_status=health.status,
+        reason=health.reason,
+    )
 
 
 def register_remote_memory_policy() -> None:
