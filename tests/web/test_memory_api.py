@@ -13,7 +13,10 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote
-from xagent.core.memory.remote import RemoteMemoryStoreError
+from xagent.core.memory.remote import (
+    RemoteMemoryStoreError,
+    RemoteMemoryStoreIncompleteError,
+)
 from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.api.memory import MemoryManagementRouter
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
@@ -330,6 +333,17 @@ class TestMemoryListEndpoint:
         assert response.status_code == 200
         assert response.json()["memories"] == []
         assert response.json()["total_count"] == 0
+
+    def test_incomplete_remote_list_never_reports_a_total(
+        self, client, mock_memory_store, auth_headers
+    ):
+        mock_memory_store.list_all.side_effect = RemoteMemoryStoreIncompleteError(
+            "Remote memory list is incomplete"
+        )
+        response = client.get("/api/memory/list?limit=5", headers=auth_headers)
+        assert response.status_code == 503
+        assert "total_count" not in response.json()
+        assert "memories" not in response.json()
 
     def test_search_memories_sanitizes_backend_failure(
         self, client, mock_memory_store, auth_headers
@@ -1067,3 +1081,50 @@ class TestMemoryApiIntegration:
         )
         # Should fail due to missing required content field
         assert response.status_code == 422
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_memsrv_envelope_through_adapter_and_web(
+    client, mock_memory_store, auth_headers, test_db, truncated
+):
+    import json
+
+    import requests
+
+    from xagent.core.memory.remote import RemoteMemoryStore
+
+    calls = []
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            calls.append({"method": method, "url": url, **kwargs})
+            response = requests.Response()
+            response.status_code = 200
+            response._content = json.dumps(
+                {
+                    "results": [
+                        {"id": "a", "content": "one"},
+                        {"id": "b", "content": "two"},
+                    ],
+                    "limit": 10000,
+                    "truncated": truncated,
+                }
+            ).encode()
+            return response
+
+    adapter = RemoteMemoryStore("http://memsrv:8080", "runtime-key", session=Session())
+    mock_memory_store.list_all.side_effect = adapter.list_all
+    response = client.get(
+        "/api/memory/list?category=general&limit=1", headers=auth_headers
+    )
+    assert calls[0]["headers"]["X-User-External-Id"] == str(test_db.id)
+    assert calls[0]["json"] == {"filters": {"category": "general"}}
+    assert len(calls) == 1
+    if truncated:
+        assert response.status_code == 503
+        assert "total_count" not in response.json()
+        assert "memories" not in response.json()
+    else:
+        assert response.status_code == 200
+        assert response.json()["total_count"] == 2
+        assert [note["id"] for note in response.json()["memories"]] == ["a"]

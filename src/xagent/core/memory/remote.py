@@ -359,6 +359,10 @@ class RemoteMemoryStoreAuthenticationError(RemoteMemoryStoreError):
     """The remote memory service rejected the service credentials (HTTP 401)."""
 
 
+class RemoteMemoryStoreIncompleteError(RemoteMemoryStoreError):
+    """A bounded list response cannot satisfy a complete-list request."""
+
+
 class RemoteMemoryStoreConfigurationError(RuntimeError):
     """The remote backend is selected but not completely configured."""
 
@@ -1398,7 +1402,18 @@ class RemoteMemoryStore(MemoryStore):
             "POST", path, body={"filters": self._filters_payload(filters)}
         )
         self._raise_for_error(path, response)
-        items = self._note_items(path, self._json(path, response))
+        payload = self._json(path, response)
+        # Completeness belongs to this endpoint's envelope. Search and inbox
+        # intentionally use bounded results and keep their extraction contract.
+        if not isinstance(payload, dict) or type(payload.get("truncated")) is not bool:
+            raise RemoteMemoryStoreError(
+                "Remote memory list response has no valid completeness flag"
+            )
+        if payload["truncated"]:
+            raise RemoteMemoryStoreIncompleteError(
+                "Remote memory list is incomplete; narrow the filters before retrying"
+            )
+        items = self._note_items(path, payload)
         return [_note_from_payload(item) for item in items]
 
     def inbox_list(self, include_read: bool = False) -> List[MemoryNote]:
@@ -1539,6 +1554,7 @@ __all__ = [
     "RemoteMemoryStoreAuthenticationError",
     "RemoteMemoryStoreConfigurationError",
     "RemoteMemoryStoreError",
+    "RemoteMemoryStoreIncompleteError",
     "WRITE_TIMEOUT_SECONDS",
     "explicit_memory_owner",
     "remote_memory_ready",
