@@ -28,7 +28,6 @@ from ..core.memory.remote import (
     RemoteMemoryStore,
     remote_memory_readiness,
     remote_upstream_report,
-    require_remote_memory_identity,
 )
 from .memory_lifecycle import (
     AdmissionResult,
@@ -339,12 +338,11 @@ class DynamicMemoryStoreManager:
         """
         with self._lock:
             publication = self._publication
-        if (
-            not control_plane
-            and publication is not None
-            and isinstance(unwrap_memory_store(publication.store), RemoteMemoryStore)
-        ):
-            require_remote_memory_identity()
+        base_store = (
+            unwrap_memory_store(publication.store) if publication is not None else None
+        )
+        if not control_plane and isinstance(base_store, RemoteMemoryStore):
+            base_store.validate_identity_context()
 
     def status(self, *, control_plane: bool = False) -> MemoryLifecycleStatus:
         """Current public-safe lifecycle status. Never admits."""
@@ -440,6 +438,10 @@ class DynamicMemoryStoreManager:
             isinstance(base_store, RemoteMemoryStore)
             and status.state is MemoryLifecycleState.READY
         ):
+            # The preceding readiness call may have observed a context change.
+            # Revalidate before the separate upstream-report probe as well.
+            if not control_plane:
+                base_store.validate_identity_context()
             try:
                 remote_state, remote_detail = remote_upstream_report()
             except Exception:

@@ -14,14 +14,6 @@ from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field
 
-from .memory_prompts import (
-    CHECK_INBOX_DESCRIPTION,
-    DELETE_MEMORY_DESCRIPTION,
-    DELIVER_MEMORY_DESCRIPTION,
-    SEARCH_MEMORY_DESCRIPTION,
-    STORE_MEMORY_DESCRIPTION,
-    UPDATE_MEMORY_DESCRIPTION,
-)
 from ...memory.core import MemoryNote, drop_replaced_tags
 from ...memory.remote import (
     NOT_FOUND_OR_DENIED_ERROR,
@@ -33,6 +25,14 @@ from ..trace import (
     trace_memory_retrieve_start,
     trace_memory_store_end,
     trace_memory_store_start,
+)
+from .memory_prompts import (
+    CHECK_INBOX_DESCRIPTION,
+    DELETE_MEMORY_DESCRIPTION,
+    DELIVER_MEMORY_DESCRIPTION,
+    SEARCH_MEMORY_DESCRIPTION,
+    STORE_MEMORY_DESCRIPTION,
+    UPDATE_MEMORY_DESCRIPTION,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,6 @@ MemoryKind = Literal[
     "domain_insight",
 ]
 _MEMORY_KINDS = frozenset(get_args(MemoryKind))
-
 
 
 class StoreMemoryArgs(BaseModel):
@@ -851,9 +850,7 @@ def _is_not_found_text(text: Any) -> bool:
     return bool(candidate) and candidate.startswith(_ABSENT_TEXT)
 
 
-def _receipt_state(
-    get: Any, memory_id: Any
-) -> tuple[str, str | None, Any, str | None]:
+def _receipt_state(get: Any, memory_id: Any) -> tuple[str, str | None, Any, str | None]:
     """Classify one read-back as ``absent`` / ``present`` / ``unconfirmed``.
 
     ``remote.py::get`` answers 403/404 with ``success=False`` and
@@ -928,9 +925,7 @@ SearchSpace = Literal["personal", "department", "company"]
 _SEARCH_SPACE_VALUES = ("personal", "department", "company")
 
 
-def _search_filters(
-    space: Any, category: Any
-) -> tuple[dict[str, Any], str | None]:
+def _search_filters(space: Any, category: Any) -> tuple[dict[str, Any], str | None]:
     """Build the optional ``space``/``category`` filter keys (§4.7).
 
     Returns ``(filters, None)`` for valid input and ``({}, message)`` for an
@@ -1476,9 +1471,7 @@ class CheckInboxTool:
                 "error": "the active memory store cannot list an inbox.",
             }
         try:
-            notes = await asyncio.to_thread(
-                list_all, {"metadata": {"deliver": True}}
-            )
+            notes = await asyncio.to_thread(list_all, {"metadata": {"deliver": True}})
         except Exception as exc:
             logger.exception("check_inbox failed")
             return {

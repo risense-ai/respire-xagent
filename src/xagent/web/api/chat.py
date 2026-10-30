@@ -157,7 +157,8 @@ def _persist_task_memory_dimensions(task: Task) -> None:
     scope = replace(existing or ExecutionScope(), memory_dimensions=dimensions)
     config = dict(task.agent_config or {})
     config[EXECUTION_SCOPE_AGENT_CONFIG_KEY] = scope.to_dict()
-    task.agent_config = config
+    # Legacy SQLAlchemy Column annotations do not describe instance JSON values.
+    task.agent_config = cast(Any, config)
 
 
 def _load_agent_for_task_create(

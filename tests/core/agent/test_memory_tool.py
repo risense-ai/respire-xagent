@@ -24,12 +24,12 @@ from xagent.core.agent.context.memory_tool import (
 )
 from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.lancedb import LanceDBMemoryStore
-from xagent.core.user_context import current_user_id
 from xagent.core.memory.remote import (
     RemoteMemoryStore,
     RemoteMemoryStoreAuthenticationError,
     RemoteMemoryStoreError,
 )
+from xagent.core.user_context import current_user_id
 from xagent.web.memory_lifecycle import MemoryLifecycleState, MemoryLifecycleStatus
 from xagent.web.revocable_memory_store import RevocableMemoryStore
 from xagent.web.user_isolated_memory import UserIsolatedMemoryStore
@@ -993,11 +993,11 @@ async def test_store_memory_retries_a_create_when_the_receipt_read_raises_404() 
 
 
 @pytest.mark.asyncio
-async def test_store_memory_recreates_when_the_receipt_note_lacks_the_new_text() -> None:
+async def test_store_memory_recreates_when_the_receipt_note_lacks_the_new_text() -> (
+    None
+):
     """X-04: a live id is not proof of a merge — the body has to carry the text."""
-    store = JudgedMemoryStore(
-        action="merge", receipt_body="an unrelated older fact"
-    )
+    store = JudgedMemoryStore(action="merge", receipt_body="an unrelated older fact")
     tool = StoreMemoryTool(memory_store=store, task="task")
 
     result = await tool.execute(content="A durable business fact.")
@@ -1188,7 +1188,9 @@ async def test_store_memory_does_not_rewrite_when_the_2xx_body_is_unparsable() -
 
 
 @pytest.mark.asyncio
-async def test_store_memory_claims_no_cause_when_the_readback_cannot_be_classified() -> None:
+async def test_store_memory_claims_no_cause_when_the_readback_cannot_be_classified() -> (
+    None
+):
     """An unclassifiable read-back states no cause instead of guessing one.
 
     The message still stops a duplicate write, but it must not name a timeout,
@@ -1580,7 +1582,9 @@ def memory_identity() -> Any:
 
 
 @pytest.mark.asyncio
-async def test_check_inbox_through_the_full_production_chain(memory_identity: Any) -> None:
+async def test_check_inbox_through_the_full_production_chain(
+    memory_identity: Any,
+) -> None:
     """Revocable(user_isolated(remote)): live reads go over the inbox routes,
     and a revoked reference fails closed instead of reaching the adapter."""
     session = _ScriptedSession(
@@ -1626,7 +1630,9 @@ async def test_check_inbox_through_the_full_production_chain(memory_identity: An
 
 
 @pytest.mark.asyncio
-async def test_check_inbox_reaches_the_adapter_behind_a_hiding_wrapper(memory_identity: Any) -> None:
+async def test_check_inbox_reaches_the_adapter_behind_a_hiding_wrapper(
+    memory_identity: Any,
+) -> None:
     """A wrapper without forwarding methods must not hide the capability."""
     session = _ScriptedSession(
         (
@@ -1662,7 +1668,9 @@ async def test_check_inbox_reaches_the_adapter_behind_a_hiding_wrapper(memory_id
 
 
 @pytest.mark.asyncio
-async def test_check_inbox_falls_back_to_legacy_on_a_missing_inbox_route(memory_identity: Any) -> None:
+async def test_check_inbox_falls_back_to_legacy_on_a_missing_inbox_route(
+    memory_identity: Any,
+) -> None:
     """An old service answers 404 for the inbox routes: use the legacy path."""
     session = _ScriptedSession((404, {"error": {"message": "no such route"}}))
     wrapper = _WrappedRemoteStore(
@@ -1755,7 +1763,9 @@ async def test_delete_memory_surfaces_the_service_message() -> None:
         def delete(self, note_id: str) -> MemoryResponse:
             raise RemoteMemoryStoreError(APPEND_ONLY_409, status_code=409)
 
-    tool = DeleteMemoryTool(memory_store=ConflictingDeleteStore({"mem-1": _note("mem-1", "x")}))
+    tool = DeleteMemoryTool(
+        memory_store=ConflictingDeleteStore({"mem-1": _note("mem-1", "x")})
+    )
 
     result = await tool.execute(memory_id="mem-1")
 

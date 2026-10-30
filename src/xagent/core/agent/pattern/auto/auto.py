@@ -96,7 +96,7 @@ class AutoDecision:
     durable_facts: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "action": self.action.value,
             "reason": self.reason,
             "requires_current_or_external_facts": (
@@ -177,7 +177,7 @@ def _coerce_bool(value: Any, *, default: bool) -> bool:
 def _coerce_str_list(value: Any) -> list[str]:
     """Normalize the router's ``durable_facts`` field to a clean string list.
 
-    The field is optional in the decision schema, so anything unparseable
+    The field is optional in the decision schema, so anything unparsable
     degrades to "nothing to remember" rather than failing the routing decision
     the user is waiting on.
     """
@@ -1372,12 +1372,8 @@ class AutoPattern(AgentPattern):
         skill_loading_available: bool = False,
         evidence_state: EvidenceState,
     ) -> str:
-        memory_rule = (
-            AUTO_MEMORY_RULE if memory_tools_available else ""
-        )
-        durable_rule = (
-            AUTO_DURABLE_RULE if memory_tools_available else ""
-        )
+        memory_rule = AUTO_MEMORY_RULE if memory_tools_available else ""
+        durable_rule = AUTO_DURABLE_RULE if memory_tools_available else ""
         # Both the count and the name list leave out the stored-result reader
         # (see _execution_tool_names), so its exclusion changes neither.
         tool_count = sum(

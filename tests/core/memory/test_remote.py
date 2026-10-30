@@ -20,7 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, List, Optional, cast
 
 import pytest
@@ -44,8 +44,8 @@ from xagent.core.memory.remote import (
     RemoteMemoryStoreAuthenticationError,
     RemoteMemoryStoreConfigurationError,
     RemoteMemoryStoreError,
-    RemoteMemoryStoreIncompleteError,
     RemoteMemoryStoreIdentityError,
+    RemoteMemoryStoreIncompleteError,
     delegated_agent_identity,
     explicit_memory_owner,
     registered_agent_seats,
@@ -347,7 +347,10 @@ def test_get_decodes_content_b64_and_normalizes_aware_timestamp() -> None:
 
     assert isinstance(note, MemoryNote)
     assert note.content == b"\x00\x01"
-    assert note.timestamp == datetime(2026, 1, 2, 3, 4, 5)
+    # The wire instant is 19:04 UTC; the adapter returns naive local time.
+    expected = datetime(2026, 1, 1, 19, 4, 5, tzinfo=timezone.utc)
+    assert note.timestamp == expected.astimezone().replace(tzinfo=None)
+    assert note.timestamp.tzinfo is None
 
 
 @pytest.mark.parametrize("status", [403, 404])
@@ -888,9 +891,7 @@ def test_timeout_reports_an_unreachable_upstream_not_a_credential() -> None:
     assert "timed out" in text
 
 
-def test_connection_failure_reports_an_unreachable_upstream_not_a_credential() -> (
-    None
-):
+def test_connection_failure_reports_an_unreachable_upstream_not_a_credential() -> None:
     store = RecordingStore(requests.exceptions.ConnectionError("refused"))
 
     with pytest.raises(RemoteMemoryStoreError) as error:

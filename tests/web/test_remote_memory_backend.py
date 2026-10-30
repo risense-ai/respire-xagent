@@ -546,3 +546,179 @@ def test_remote_user_reports_require_identity_before_any_probe(
             manager.get_store_info()
     finally:
         current_user_id.reset(token)
+
+
+@pytest.fixture
+def bound_remote_reports(monkeypatch: pytest.MonkeyPatch) -> Any:
+    import hashlib
+
+    from xagent.core.memory import agent_seats
+
+    _select_remote(monkeypatch)
+    registry = agent_seats.TrustedAgentSeatRegistry()
+    registry.publish(
+        service_url="http://memsrv:8080",
+        user_id=23,
+        runtime_profile=hashlib.sha256(b"svc-key").hexdigest(),
+        agent_ids=[7],
+        ttl_seconds=30,
+        status="active",
+    )
+    monkeypatch.setattr(agent_seats, "_provider", registry)
+    monkeypatch.setattr(agent_seats, "_provider_generation", 1)
+    calls: list[str] = []
+
+    def readiness() -> RemoteMemoryReadiness:
+        calls.append("readyz")
+        return RemoteMemoryReadiness("ready", semantic_available=True)
+
+    def upstream() -> tuple[str, str]:
+        calls.append("upstream")
+        return "ready", "synthetic upstream report"
+
+    monkeypatch.setattr(manager_module, "remote_memory_readiness", readiness)
+    monkeypatch.setattr(manager_module, "remote_upstream_report", upstream)
+    manager = DynamicMemoryStoreManager()
+    manager.admit()
+    return registry, manager, calls
+
+
+@pytest.mark.parametrize("report", ["status", "get_store_info"])
+@pytest.mark.parametrize(
+    ("independent", "change"),
+    [
+        (independent, change)
+        for independent in (False, True)
+        for change in (
+            "user",
+            "missing",
+            "zero_user",
+            "empty_user",
+            "blank_user",
+            "mode",
+            "endpoint",
+            "key",
+            "provider",
+        )
+        if independent or change != "provider"
+    ],
+)
+def test_user_health_reports_cannot_revive_invalidated_scope(
+    bound_remote_reports: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    report: str,
+    independent: bool,
+    change: str,
+) -> None:
+    from xagent.core.memory.agent_seats import set_trusted_agent_seat_provider
+    from xagent.core.memory.remote import (
+        RemoteMemoryStoreIdentityError,
+        delegated_agent_identity,
+    )
+    from xagent.core.user_context import current_user_id
+
+    registry, manager, calls = bound_remote_reports
+    initial_mode = "1" if independent else "0"
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", initial_mode)
+    with delegated_agent_identity(7, store=manager.get_memory_store()):
+        result = getattr(manager, report)()
+        if report == "status":
+            assert result.ready and result.vector_search
+        else:
+            assert result["state"] == "ready" and result["supports_vector_search"]
+        answered = list(calls)
+        if change in {"user", "missing", "zero_user", "empty_user", "blank_user"}:
+            invalid_user: Any = {
+                "user": 32,
+                "missing": None,
+                "zero_user": 0,
+                "empty_user": "",
+                "blank_user": " ",
+            }[change]
+            current_user_id.set(invalid_user)
+        elif change == "mode":
+            monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "0" if independent else "1")
+        elif change == "endpoint":
+            monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", "http://other-service")
+        elif change == "key":
+            monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", "other-runtime-key")
+        else:
+            set_trusted_agent_seat_provider(None)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            getattr(manager, report)()
+        assert calls == answered
+        current_user_id.set(23)
+        monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", initial_mode)
+        monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", "http://memsrv:8080")
+        monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", "svc-key")
+        if change == "provider":
+            set_trusted_agent_seat_provider(registry)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            getattr(manager, report)()
+        assert calls == answered
+        with delegated_agent_identity(7, store=manager.get_memory_store()):
+            getattr(manager, report)()
+        after_fresh_scope = list(calls)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            getattr(manager, report)()
+        assert calls == after_fresh_scope
+
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_scope_change_during_readiness_blocks_upstream_report_probe(
+    bound_remote_reports: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    independent: bool,
+) -> None:
+    from xagent.core.memory.remote import (
+        RemoteMemoryStoreIdentityError,
+        delegated_agent_identity,
+    )
+
+    _registry, manager, calls = bound_remote_reports
+    initial_mode = "1" if independent else "0"
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", initial_mode)
+    original = manager_module.remote_memory_readiness
+
+    def changed_after_probe() -> RemoteMemoryReadiness:
+        result = original()
+        monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "0" if independent else "1")
+        return result
+
+    monkeypatch.setattr(manager_module, "remote_memory_readiness", changed_after_probe)
+    with delegated_agent_identity(7, store=manager.get_memory_store()):
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            manager.get_store_info()
+        assert calls == ["readyz"]
+        monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", initial_mode)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            manager.get_store_info()
+        assert calls == ["readyz"]
+
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_explicit_control_plane_report_does_not_reauthorize_invalid_user_scope(
+    bound_remote_reports: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    independent: bool,
+) -> None:
+    from xagent.core.memory.remote import (
+        RemoteMemoryStoreIdentityError,
+        delegated_agent_identity,
+    )
+    from xagent.core.user_context import current_user_id
+
+    _registry, manager, calls = bound_remote_reports
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "1" if independent else "0")
+    with delegated_agent_identity(7, store=manager.get_memory_store()):
+        current_user_id.set(None)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            manager.status()
+        assert calls == []
+        assert manager.status(control_plane=True).ready
+        assert manager.get_store_info(control_plane=True)["state"] == "ready"
+        answered = list(calls)
+        current_user_id.set(23)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            manager.get_store_info()
+        assert calls == answered

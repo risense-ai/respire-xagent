@@ -5721,12 +5721,16 @@ async def _forced_turn_call(
     ],
 )
 async def test_forced_turn_stays_single_tool(
-    cell: str, overrides: dict[str, Any]
+    cell: str, overrides: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When any condition for offering reads fails, the forced turn sends
     exactly the baseline final_answer schema. Where no allowance is used up,
     and on the settlement-fence turn whatever the counters say, the prompt is
     byte-identical to a run that stored nothing and has no reader."""
+    # These are separate turns; compare policy output at the same clock input.
+    monkeypatch.setattr(
+        ExecutionContext, "_current_clock_text", lambda self: "2026-01-02 03:04:05 UTC"
+    )
     options: dict[str, Any] = {"stored": True, "reader": True, **overrides}
     pattern, call = await _forced_turn_call(**options)
 
