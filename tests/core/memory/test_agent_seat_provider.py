@@ -334,6 +334,14 @@ def test_both_identity_modes_bind_entry_context_until_scope_exit(
             monkeypatch.setattr(store, "_service_key", "other-runtime-key")
         with pytest.raises(RemoteMemoryStoreIdentityError):
             store.search("changed context cannot reuse old scope")
+        # Observing invalidity ends the old scope, even if a setting is restored.
+        monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "1" if independent else "0")
+        current_user_id.set(31)
+        monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", URL)
+        monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", KEY)
+        monkeypatch.setattr(store, "_service_key", KEY)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("restoration cannot revive the invalidated scope")
     assert len(transport.calls) == 1
     assert transport.calls[0]["headers"]["X-User-External-Id"] == (
         "agent:7" if independent else "31"
