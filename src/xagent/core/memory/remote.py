@@ -661,15 +661,17 @@ class RemoteMemoryStore(MemoryStore):
 
     def validate_identity_context(self) -> str:
         """Validate the effective user/scope locally before data or user health I/O."""
-        identity = require_remote_memory_identity(self._user_id_provider())
         binding = _agent_identity_override.get()
         if binding is not None:
+            # A missing identity is an observed binding failure too. Keep the
+            # guard inside validation so restoring the user cannot revive it.
             self._validate_identity_binding(binding)
-        return (
-            f"agent:{binding.agent_ref}"
-            if isinstance(binding, _AgentIdentityBinding)
-            else identity
-        )
+            return (
+                f"agent:{binding.agent_ref}"
+                if isinstance(binding, _AgentIdentityBinding)
+                else binding.user_external_id
+            )
+        return require_remote_memory_identity(self._user_id_provider())
 
     def _headers(self) -> dict[str, str]:
         """Build request headers (§3.4).
