@@ -3927,3 +3927,21 @@ def test_execution_budget_env_default_cannot_exceed_maximum(monkeypatch):
     monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_MAX_TOKENS", "100")
     with pytest.raises(ValueError, match="must not exceed"):
         get_execution_budget_defaults()
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_memory_agent_seats_file_unconfigured(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv(config.MEMORY_AGENT_SEATS_FILE, raising=False)
+    else:
+        monkeypatch.setenv(config.MEMORY_AGENT_SEATS_FILE, value)
+    assert config.get_memory_agent_seats_file() is None
+
+
+def test_memory_agent_seats_file_requires_absolute_host_path(monkeypatch, tmp_path):
+    monkeypatch.setenv(config.MEMORY_AGENT_SEATS_FILE, "task/grants.json")
+    with pytest.raises(ValueError, match="absolute"):
+        config.get_memory_agent_seats_file()
+    path = tmp_path / "grants.json"
+    monkeypatch.setenv(config.MEMORY_AGENT_SEATS_FILE, f" {path} ")
+    assert config.get_memory_agent_seats_file() == path

@@ -1627,6 +1627,10 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     with _startup_phase("host admission"):
         await run_host_startup_admissions(app_instance)
 
+    from ..core.memory.seat_file_provider import start_memory_seat_runtime
+
+    start_memory_seat_runtime()
+
     # Validate the default-on async trace backend before opening task ingress.
     from .services.trace_database import get_trace_database_runtime
 
@@ -2229,6 +2233,9 @@ async def startup_event() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
+    from ..core.memory.seat_file_provider import stop_memory_seat_runtime
+
+    stop_memory_seat_runtime()
     global \
         _file_storage_startup_sync_task, \
         _migration_task, \

@@ -98,6 +98,9 @@ async def run_worker(
     try:
         if initialize_host is not None:
             await initialize_host()
+        from ..core.memory.seat_file_provider import start_memory_seat_runtime
+
+        start_memory_seat_runtime()
         register_local_browser_runtime()
         register_execution_scope_snapshot_loader()
         initialize_langfuse()
@@ -169,6 +172,9 @@ async def run_worker(
                 await sandbox.cleanup()
             flush_langfuse()
         finally:
+            from ..core.memory.seat_file_provider import stop_memory_seat_runtime
+
+            stop_memory_seat_runtime()
             await stop_process_diagnostics(diagnostics)
 
 

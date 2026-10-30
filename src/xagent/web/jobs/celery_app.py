@@ -9,7 +9,13 @@ from importlib import import_module
 from typing import Any
 
 from celery import Celery
-from celery.signals import worker_init
+from celery.signals import (
+    worker_init,
+    worker_process_init,
+    worker_process_shutdown,
+    worker_ready,
+    worker_shutdown,
+)
 
 from ...config import (
     get_background_job_sweep_interval_seconds,
@@ -63,6 +69,33 @@ def create_celery_app() -> Any:
 
 
 celery_app = create_celery_app()
+
+
+@worker_process_init.connect
+def start_memory_seat_provider(**_: Any) -> None:
+    # Every prefork child owns its own refresh thread.
+    from ...core.memory.seat_file_provider import start_memory_seat_runtime
+
+    start_memory_seat_runtime()
+
+
+@worker_ready.connect
+def start_memory_seats_in_nonfork_worker(sender: Any = None, **_: Any) -> None:
+    from celery.concurrency.prefork import TaskPool
+
+    if sender is None or isinstance(sender.pool, TaskPool):
+        # A prefork parent must remain thread-free: autoscaling/replacement
+        # children can fork later and must not inherit a refresh-thread lock.
+        return
+    start_memory_seat_provider()
+
+
+@worker_process_shutdown.connect
+@worker_shutdown.connect
+def stop_memory_seat_provider(**_: Any) -> None:
+    from ...core.memory.seat_file_provider import stop_memory_seat_runtime
+
+    stop_memory_seat_runtime()
 
 
 _REFUSED = 3

@@ -38,6 +38,16 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
 
     monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
     order = []
+    from xagent.core.memory import seat_file_provider
+
+    monkeypatch.setattr(
+        seat_file_provider, "start_memory_seat_runtime", lambda: order.append("seats")
+    )
+    monkeypatch.setattr(
+        seat_file_provider,
+        "stop_memory_seat_runtime",
+        lambda: order.append("seats_stop"),
+    )
     for name in (
         "configure_db",
         "validate_worker_schema",
@@ -146,6 +156,7 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
         assert "auto_resume" not in order
     else:
         await worker.run_worker(initialize_host=initialize_host, stop=stop)
+        assert order.index("host_hooks") < order.index("seats") < order.index("accept")
         assert (
             order.index("host_hooks")
             < order.index("bridge")

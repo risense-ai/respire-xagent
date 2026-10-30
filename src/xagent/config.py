@@ -301,6 +301,7 @@ MEMORY_BACKEND = "XAGENT_MEMORY_BACKEND"
 MEMORY_SERVICE_URL = "XAGENT_MEMORY_SERVICE_URL"
 MEMORY_SERVICE_KEY = "XAGENT_MEMORY_SERVICE_KEY"
 MEMORY_AGENT_SEATS = "XAGENT_MEMORY_AGENT_SEATS"
+MEMORY_AGENT_SEATS_FILE = "XAGENT_MEMORY_AGENT_SEATS_FILE"
 
 WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
 
@@ -4022,3 +4023,18 @@ def get_memory_agent_seats_enabled() -> bool:
     A disabled switch explicitly keeps the authenticated parent identity.
     """
     return _get_bool_env(MEMORY_AGENT_SEATS, True)
+
+
+def get_memory_agent_seats_file() -> Path | None:
+    """Trusted host grant bundle, mounted read-only outside writable task data.
+
+    No default bundle or automatic provisioning. Reject relative paths so a
+    task's working directory cannot select the authorization source.
+    """
+    value = os.getenv(MEMORY_AGENT_SEATS_FILE, "").strip()
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("memory agent seats file must be an absolute path")
+    return path
