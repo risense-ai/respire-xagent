@@ -393,3 +393,55 @@ def test_both_agent_service_call_sites_carry_the_memory_policy() -> None:
     assert len(call_sites) == 2, "expected the fresh-agent and reconstruction sites"
     for keywords in call_sites:
         assert required <= keywords
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        MemoryPolicyDecision(
+            False, False, "down", remote_status="unavailable", semantic_available=True
+        ),
+        MemoryPolicyDecision(
+            False,
+            False,
+            "invalid",
+            remote_status="protocol_error",
+            semantic_available=True,
+        ),
+        MemoryPolicyDecision(
+            True, True, remote_status="ready", semantic_available=False
+        ),
+        MemoryPolicyDecision(
+            True, True, "degraded", remote_status="degraded", semantic_available=True
+        ),
+        MemoryPolicyDecision(
+            False, True, "down", remote_status="unavailable", semantic_available=False
+        ),
+        MemoryPolicyDecision(
+            True, True, remote_status="degraded", semantic_available=False
+        ),
+    ],
+)
+def test_remote_policy_rejects_inconsistent_state_and_capabilities(decision):
+    from xagent.web.services.memory_policy import resolve_trusted_memory_policy
+
+    set_trusted_memory_policy_resolver(lambda _request: decision)
+    result = resolve_trusted_memory_policy(
+        MemoryPolicyRequest(17, 23, 41, "a2a", False)
+    )
+    assert result == MemoryPolicyDecision(
+        False, False, MEMORY_POLICY_RESOLVER_FAILURE_REASON
+    )
+
+
+def test_remote_policy_preserves_valid_degraded_capabilities():
+    from xagent.web.services.memory_policy import resolve_trusted_memory_policy
+
+    decision = MemoryPolicyDecision(
+        True, True, "degraded", remote_status="degraded", semantic_available=False
+    )
+    set_trusted_memory_policy_resolver(lambda _request: decision)
+    assert (
+        resolve_trusted_memory_policy(MemoryPolicyRequest(17, 23, 41, "a2a", False))
+        == decision
+    )

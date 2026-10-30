@@ -145,6 +145,8 @@ READINESS_UNAVAILABLE_REASON = "remote_memory_unavailable"
 READINESS_UNCONFIGURED_REASON = "remote_memory_unconfigured"
 IDENTITY_REQUIRED_REASON = "remote_memory_identity_required"
 AGENT_SEAT_REQUIRED_REASON = "remote_memory_agent_seat_required"
+READINESS_DEGRADED_REASON = "remote_memory_degraded"
+READINESS_PROTOCOL_ERROR_REASON = "remote_memory_protocol_error"
 
 #: The explicit-owner override of the *current* context (T14 §B1-2). It is a
 #: context variable rather than an instance attribute because one adapter
@@ -153,7 +155,9 @@ AGENT_SEAT_REQUIRED_REASON = "remote_memory_agent_seat_required"
 _explicit_owner_override: ContextVar[Optional[int]] = ContextVar(
     "remote_memory_explicit_owner", default=None
 )
-_readiness_cache: Optional[tuple[float, bool, Optional[str]]] = None
+_readiness_cache: tuple[float, tuple[str | None, str], RemoteMemoryReadiness] | None = (
+    None
+)
 _readiness_cache_lock = threading.Lock()
 
 
@@ -385,43 +389,79 @@ def delegated_agent_identity(
         _agent_identity_override.reset(token)
 
 
+@dataclass(frozen=True)
+class RemoteMemoryReadiness:
+    """Dependency health only; never evidence of a user's authorization.
+
+    Semantic capability describes the current embedder's state, not historical
+    vector coverage or reindex completion. Snapshots may be cached for 30s and
+    therefore do not promise real-time availability.
+    """
+
+    status: str
+    semantic_available: bool = False
+    reason: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.status in {"ready", "degraded"}
+
+
+def remote_memory_readiness(
+    *,
+    refresh: bool = False,
+    session: Optional[requests.Session] = None,
+) -> RemoteMemoryReadiness:
+    """Return health and semantic capability, cached by URL and credential.
+
+    This is a control-plane health probe. User-operation callers must validate
+    their trusted identity before invoking it; readiness never authorizes data.
+    """
+    global _readiness_cache
+    now = time.monotonic()
+    base_url = get_memory_service_url()
+    service_key = get_memory_service_key()
+    config_key = (base_url, hashlib.sha256((service_key or "").encode()).hexdigest())
+    if not refresh:
+        with _readiness_cache_lock:
+            cached = _readiness_cache
+        if (
+            cached is not None
+            and cached[1] == config_key
+            and now - cached[0] < READINESS_CACHE_SECONDS
+        ):
+            return cached[2]
+
+    result = _probe_readyz(session, base_url, service_key)
+    with _readiness_cache_lock:
+        _readiness_cache = (now, config_key, result)
+    return result
+
+
 def remote_memory_ready(
     *,
     refresh: bool = False,
     session: Optional[requests.Session] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Probe the memory service's readiness endpoint (T14 §B1-3).
+    """Compatibility wrapper: usable storage, with a reason even if degraded.
 
-    Returns ``(available, reason)`` with ``reason`` set only when the answer is
-    negative. A transport failure, a timeout, a non-2xx status or a missing
-    service URL all report unavailable -- never an empty success, so no caller
-    can mistake "the service is down" for "memory is fine". The answer is
-    cached for ``READINESS_CACHE_SECONDS``; ``refresh=True`` forces a probe.
-
-    Args:
-        refresh: Bypass the cached answer.
-        session: Optional injected session (tests).
+    A true flag does not promise semantic search. Consumers needing capabilities
+    must use ``remote_memory_readiness``.
     """
-    global _readiness_cache
-    now = time.monotonic()
-    if not refresh:
-        with _readiness_cache_lock:
-            cached = _readiness_cache
-        if cached is not None and now - cached[0] < READINESS_CACHE_SECONDS:
-            return cached[1], cached[2]
-
-    available, reason = _probe_readyz(session)
-    with _readiness_cache_lock:
-        _readiness_cache = (now, available, reason)
-    return available, reason
+    result = remote_memory_readiness(refresh=refresh, session=session)
+    return result.available, result.reason
 
 
-def _probe_readyz(session: Optional[requests.Session]) -> tuple[bool, Optional[str]]:
-    """Send one readiness request and classify the answer."""
-    base_url = get_memory_service_url()
+def _probe_readyz(
+    session: Optional[requests.Session],
+    base_url: str | None,
+    service_key: str | None,
+) -> RemoteMemoryReadiness:
+    """Classify the server's status/db/embedding contract without exposing details."""
     if not base_url:
-        return False, READINESS_UNCONFIGURED_REASON
-    service_key = get_memory_service_key()
+        return RemoteMemoryReadiness(
+            "unavailable", reason=READINESS_UNCONFIGURED_REASON
+        )
     headers = {"Authorization": f"Bearer {service_key}"} if service_key else {}
     try:
         response = (session if session is not None else _get_shared_session()).get(
@@ -429,15 +469,52 @@ def _probe_readyz(session: Optional[requests.Session]) -> tuple[bool, Optional[s
             headers=headers,
             timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
         )
-    except requests.exceptions.RequestException as error:
-        logger.warning("Remote memory readiness probe failed: %s", error)
-        return False, READINESS_UNAVAILABLE_REASON
-    if 200 <= response.status_code < 300:
-        return True, None
-    logger.warning(
-        "Remote memory readiness probe answered HTTP %s", response.status_code
+    except requests.exceptions.RequestException:
+        return RemoteMemoryReadiness("unavailable", reason=READINESS_UNAVAILABLE_REASON)
+    if not 200 <= response.status_code < 300:
+        return RemoteMemoryReadiness("unavailable", reason=READINESS_UNAVAILABLE_REASON)
+    invalid = RemoteMemoryReadiness(
+        "protocol_error", reason=READINESS_PROTOCOL_ERROR_REASON
     )
-    return False, READINESS_UNAVAILABLE_REASON
+    if response.status_code != 200:
+        return invalid
+    try:
+        payload = response.json()
+    except ValueError:
+        return invalid
+    if not isinstance(payload, dict):
+        return invalid
+    status, db, embedding = (
+        payload.get("status"),
+        payload.get("db"),
+        payload.get("embedding"),
+    )
+    if (
+        not isinstance(status, str)
+        or not isinstance(db, str)
+        or status not in {"ok", "degraded", "unavailable"}
+        or db not in {"ok", "error"}
+    ):
+        return invalid
+    if not isinstance(embedding, dict):
+        return invalid
+    embedding_status = embedding.get("status")
+    degraded = embedding.get("degraded")
+    if (
+        not isinstance(embedding_status, str)
+        or embedding_status not in {"ok", "degraded"}
+        or type(degraded) is not bool
+    ):
+        return invalid
+    if degraded != (embedding_status == "degraded"):
+        return invalid
+    if db == "error" or status == "unavailable":
+        return RemoteMemoryReadiness("unavailable", reason=READINESS_UNAVAILABLE_REASON)
+    if (status == "degraded") != degraded:
+        return invalid
+    if degraded:
+        return RemoteMemoryReadiness("degraded", reason=READINESS_DEGRADED_REASON)
+    return RemoteMemoryReadiness("ready", semantic_available=True)
 
 
 def _parse_delivery_marker(content: Any) -> Optional[tuple[str, str]]:
@@ -1233,5 +1310,7 @@ __all__ = [
     "WRITE_TIMEOUT_SECONDS",
     "explicit_memory_owner",
     "remote_memory_ready",
+    "remote_memory_readiness",
+    "RemoteMemoryReadiness",
     "remote_memory_store_from_config",
 ]

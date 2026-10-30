@@ -1990,7 +1990,7 @@ def _resolve_delegated_parent_memory(
             return None, False, reason or _DELEGATED_MEMORY_UNAVAILABLE_REASON
         from .....web.dynamic_memory_store import get_memory_store
 
-        return get_memory_store(), True, None
+        return get_memory_store(), True, reason
     except Exception as error:
         logger.warning("Delegated memory could not be resolved: %s", error)
         return None, False, _DELEGATED_MEMORY_UNAVAILABLE_REASON

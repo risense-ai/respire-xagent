@@ -21,7 +21,9 @@ import pytest
 
 from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.remote import (
+    READINESS_DEGRADED_REASON,
     READINESS_UNAVAILABLE_REASON,
+    RemoteMemoryReadiness,
     RemoteMemoryStore,
 )
 from xagent.web import dynamic_memory_store as manager_module
@@ -81,9 +83,9 @@ def test_remote_admission_publishes_a_ready_vector_store(monkeypatch: Any) -> No
     assert result is not None
     assert isinstance(result.store, RemoteMemoryStore)
     assert result.status.state is MemoryLifecycleState.READY
-    assert result.status.mode is not None
-    assert result.status.mode.value == "vector"
-    assert result.status.vector_search is True
+    assert result.status.mode is None
+    assert result.status.remote_status == "unknown"
+    assert result.status.vector_search is False
     # No local vector space exists to fingerprint.
     assert result.vector_space_fingerprint is None
 
@@ -109,6 +111,11 @@ def test_manager_publishes_remote_without_reading_the_authority(
         raise AssertionError("authority must not be read in remote mode")
 
     monkeypatch.setattr(manager_module, "_read_authority_snapshot", fail_read)
+    monkeypatch.setattr(
+        manager_module,
+        "remote_memory_readiness",
+        lambda: RemoteMemoryReadiness("ready", semantic_available=True),
+    )
     manager = DynamicMemoryStoreManager()
 
     manager.admit()
@@ -169,13 +176,17 @@ def test_agent_bound_tasks_get_memory_when_the_service_is_ready(
 ) -> None:
     _select_remote(monkeypatch)
     monkeypatch.setattr(
-        lifecycle_module, "remote_memory_ready", lambda **_kwargs: (True, None)
+        lifecycle_module,
+        "remote_memory_readiness",
+        lambda **_kwargs: RemoteMemoryReadiness("ready", semantic_available=True),
     )
     lifecycle_module.register_remote_memory_policy()
 
     decision = resolve_trusted_memory_policy(_policy_request())
 
-    assert decision == MemoryPolicyDecision(enabled=True, available=True)
+    assert decision == MemoryPolicyDecision(
+        enabled=True, available=True, remote_status="ready", semantic_available=True
+    )
 
 
 def test_agent_bound_tasks_leave_the_native_rule_alone_without_the_remote_backend(
@@ -184,7 +195,7 @@ def test_agent_bound_tasks_leave_the_native_rule_alone_without_the_remote_backen
     monkeypatch.delenv("XAGENT_MEMORY_BACKEND", raising=False)
     monkeypatch.setattr(
         lifecycle_module,
-        "remote_memory_ready",
+        "remote_memory_readiness",
         lambda **_kwargs: pytest.fail("the probe must not run off the remote backend"),
     )
     lifecycle_module.register_remote_memory_policy()
@@ -200,7 +211,7 @@ def test_preview_tasks_keep_the_native_rule(monkeypatch: Any) -> None:
     _select_remote(monkeypatch)
     monkeypatch.setattr(
         lifecycle_module,
-        "remote_memory_ready",
+        "remote_memory_readiness",
         lambda **_kwargs: pytest.fail("the probe must not run for a preview task"),
     )
     lifecycle_module.register_remote_memory_policy()
@@ -210,26 +221,30 @@ def test_preview_tasks_keep_the_native_rule(monkeypatch: Any) -> None:
     assert decision == MemoryPolicyDecision(enabled=False, available=True)
 
 
-def test_ordinary_tasks_keep_the_native_rule(monkeypatch: Any) -> None:
+def test_ordinary_tasks_use_remote_health(monkeypatch: Any) -> None:
     _select_remote(monkeypatch)
     monkeypatch.setattr(
         lifecycle_module,
-        "remote_memory_ready",
-        lambda **_kwargs: pytest.fail("the probe must not run for an ordinary task"),
+        "remote_memory_readiness",
+        lambda **_kwargs: RemoteMemoryReadiness("ready", semantic_available=True),
     )
     lifecycle_module.register_remote_memory_policy()
 
     decision = resolve_trusted_memory_policy(_policy_request(agent_id=None))
 
-    assert decision == MemoryPolicyDecision(enabled=True, available=True)
+    assert decision == MemoryPolicyDecision(
+        enabled=True, available=True, remote_status="ready", semantic_available=True
+    )
 
 
 def test_policy_fails_closed_when_the_service_is_not_ready(monkeypatch: Any) -> None:
     _select_remote(monkeypatch)
     monkeypatch.setattr(
         lifecycle_module,
-        "remote_memory_ready",
-        lambda **_kwargs: (False, READINESS_UNAVAILABLE_REASON),
+        "remote_memory_readiness",
+        lambda **_kwargs: RemoteMemoryReadiness(
+            "unavailable", reason=READINESS_UNAVAILABLE_REASON
+        ),
     )
     lifecycle_module.register_remote_memory_policy()
 
@@ -239,6 +254,8 @@ def test_policy_fails_closed_when_the_service_is_not_ready(monkeypatch: Any) -> 
         enabled=False,
         available=False,
         reason=READINESS_UNAVAILABLE_REASON,
+        remote_status="unavailable",
+        semantic_available=False,
     )
 
 
@@ -291,6 +308,70 @@ def test_revocable_store_reports_an_unsupported_judged_write() -> None:
         store.remember(MemoryNote(content="a durable fact"))
 
 
+def test_degraded_policy_keeps_storage_available_and_reports_semantics(
+    monkeypatch: Any,
+) -> None:
+    _select_remote(monkeypatch)
+    monkeypatch.setattr(
+        lifecycle_module,
+        "remote_memory_readiness",
+        lambda: RemoteMemoryReadiness("degraded", reason=READINESS_DEGRADED_REASON),
+    )
+    decision = lifecycle_module.resolve_remote_memory_policy(_policy_request())
+    assert decision.enabled and decision.available
+    assert decision.remote_status == "degraded"
+    assert decision.semantic_available is False
+    assert decision.reason == READINESS_DEGRADED_REASON
+
+
+def test_remote_manager_reports_current_capabilities_and_recovery(
+    monkeypatch: Any,
+) -> None:
+    _select_remote(monkeypatch)
+    health = RemoteMemoryReadiness("degraded", reason=READINESS_DEGRADED_REASON)
+    monkeypatch.setattr(manager_module, "remote_memory_readiness", lambda: health)
+    manager = DynamicMemoryStoreManager()
+    manager.admit()
+    original = manager.get_memory_store()
+    assert manager.status().remote_status == "degraded"
+    assert manager.get_store_info()["supports_vector_search"] is False
+    health = RemoteMemoryReadiness("unavailable", reason=READINESS_UNAVAILABLE_REASON)
+    assert manager.status().state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+    assert manager.get_store_info()["reason"] == READINESS_UNAVAILABLE_REASON
+    health = RemoteMemoryReadiness("ready", semantic_available=True)
+    assert manager.get_store_info()["supports_vector_search"] is True
+    assert manager.get_memory_store() is original
+
+
+def test_runtime_policy_metadata_preserves_remote_capabilities(
+    monkeypatch: Any,
+) -> None:
+    from types import SimpleNamespace
+
+    from xagent.core.memory.in_memory import InMemoryMemoryStore
+    from xagent.web.services import agent_service_manager as runtime
+
+    _select_remote(monkeypatch)
+    monkeypatch.setattr(
+        lifecycle_module,
+        "remote_memory_readiness",
+        lambda: RemoteMemoryReadiness("degraded", reason=READINESS_DEGRADED_REASON),
+    )
+    lifecycle_module.register_remote_memory_policy()
+    monkeypatch.setattr(runtime, "get_memory_store", InMemoryMemoryStore)
+    policy = runtime.resolve_agent_service_memory_policy(
+        task=SimpleNamespace(
+            id=17, user_id=23, agent_id=41, source="a2a", agent_config={}
+        )
+    )
+    assert policy.memory_enabled and policy.memory_available
+    assert policy.memory_availability_reason == READINESS_DEGRADED_REASON
+    assert policy.execution_metadata() == {
+        "memory_remote_status": "degraded",
+        "memory_semantic_available": False,
+    }
+
+
 @pytest.mark.parametrize("identity", [None, 0, "", " "])
 @pytest.mark.parametrize("agent_id", [None, 41])
 def test_policy_missing_identity_does_not_probe(
@@ -303,7 +384,7 @@ def test_policy_missing_identity_does_not_probe(
     _select_remote(monkeypatch)
     monkeypatch.setattr(
         lifecycle_module,
-        "remote_memory_ready",
+        "remote_memory_readiness",
         lambda: pytest.fail("identity must precede readyz"),
     )
     decision = lifecycle_module.resolve_remote_memory_policy(
