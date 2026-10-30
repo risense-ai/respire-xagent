@@ -9,7 +9,9 @@ Publish via atomic rename inside the mounted directory (not a single-file bind
 mount, which can pin an old inode). Each replacement, including recovery after
 an observed error, needs a larger revision. Readers poll once per second; local
 calls do no file/network I/O and fail closed if refresh stalls for three seconds.
-Absolute expiries cannot be extended by rereading or restarting a worker.
+Every refresh requires a fresh Unix-socket confirmation of the exact bundle.
+Only continuous, unchanged authorization can renew its lease without ending a
+scope. Expiry gaps, authorization changes and local failures end continuity.
 """
 
 from __future__ import annotations
@@ -19,9 +21,14 @@ import json
 import logging
 import math
 import os
+import secrets
+import socket
 import stat
+import struct
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -38,6 +45,45 @@ _MAX_BYTES = 1_048_576
 _MAX_TTL = 300
 _POLL_SECONDS = 1.0
 _FRESH_SECONDS = 3.0
+
+
+class PublicationChanged(ValueError):
+    """The live publisher advanced while a reader read its file projection."""
+
+
+def confirm_live_publication(path: Path, raw: bytes) -> None:
+    """Fresh challenge to the trusted local publisher, never a memory request.
+
+    A restarted reader cannot authenticate an old file merely because it has
+    not expired. The live publisher must confirm this exact current document.
+    The containing directory must be host-controlled and mounted read-only.
+    Linux peer credentials bind the socket server to the manifest's owner.
+    """
+    nonce = secrets.token_hex(32)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+        channel.settimeout(1)
+        channel.connect(str(path) + ".sock")
+        _pid, uid, _gid = struct.unpack(
+            "3i", channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        )
+        if uid != path.stat().st_uid:
+            raise ValueError("publisher peer does not own the publication")
+        channel.sendall((nonce + "\n").encode())
+        with channel.makefile("rb") as response:
+            line = response.readline(1025)
+        if len(line) > 1024 or not line.endswith(b"\n"):
+            raise ValueError("invalid publisher confirmation")
+        ack = json.loads(line, object_pairs_hook=_unique_object)
+        if (
+            type(ack) is not dict
+            or set(ack) != {"nonce", "sha256"}
+            or ack["nonce"] != nonce
+        ):
+            raise ValueError("invalid publisher challenge response")
+        if ack["sha256"] != hashlib.sha256(raw).hexdigest():
+            raise PublicationChanged(
+                "publication is not the publisher's current snapshot"
+            )
 
 
 def _positive_int(value: Any) -> bool:
@@ -60,14 +106,23 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 class FileAgentSeatProvider:
     """Per-process immutable publications, refreshed by a separate host thread."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        confirmer: Callable[[Path, bytes], None] = confirm_live_publication,
+    ) -> None:
         self.path = path
+        self._confirmer = confirmer
         self._lock = threading.Lock()
         self._revision = 0
         self._digest: bytes | None = None
         self._snapshots: dict[AgentSeatRequest, AgentSeatSnapshot] = {}
         self._fresh_until = 0.0
         self._healthy = False
+        self._publisher_id: str | None = None
+        self._generation = 0
+        self._source_epochs: dict[AgentSeatRequest, int] = {}
         self._closed = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -79,6 +134,9 @@ class FileAgentSeatProvider:
                 return None
             snapshot = self._snapshots.get(request)
             if snapshot is None or time.monotonic() >= snapshot.valid_until:
+                # Retire even before a later refresh sees a replacement lease.
+                self._snapshots.pop(request, None)
+                self._source_epochs.pop(request, None)
                 return None
             return snapshot
 
@@ -86,6 +144,7 @@ class FileAgentSeatProvider:
         # Keep revision/digest as a recovery fence. Replaying the same bundle
         # after a read failure cannot revive scopes that missed the failure.
         self._snapshots = {}
+        self._source_epochs = {}
         self._healthy = False
         self._fresh_until = 0.0
 
@@ -106,7 +165,16 @@ class FileAgentSeatProvider:
     def refresh(self) -> bool:
         """Host-side disk refresh. Errors revoke; no payload/path is logged."""
         try:
-            raw = self._read()
+            for attempt in range(2):
+                raw = self._read()
+                try:
+                    self._confirmer(self.path, raw)
+                    break
+                except PublicationChanged:
+                    # Atomic rename can race the challenge. Retry the local
+                    # projection once before declaring continuity broken.
+                    if attempt:
+                        raise
             document = json.loads(raw, object_pairs_hook=_unique_object)
             now, mono = time.time(), time.monotonic()
             revision, snapshots = self._parse(document, now, mono)
@@ -114,14 +182,43 @@ class FileAgentSeatProvider:
             with self._lock:
                 if self._closed:
                     return False
+                if mono >= self._fresh_until:
+                    self._invalidate()
                 if revision < self._revision or (
                     revision == self._revision
                     and (not self._healthy or digest != self._digest)
                 ):
                     raise ValueError("grant revision rollback or replay")
                 if revision > self._revision:
-                    self._snapshots = snapshots
+                    renewed = {}
+                    for request, snapshot in snapshots.items():
+                        previous = self._snapshots.get(request)
+                        if (
+                            self._healthy
+                            and document["publisher_id"] == self._publisher_id
+                            and previous is not None
+                            and previous.valid_until > mono
+                            and self._source_epochs.get(request) == snapshot.generation
+                            and previous.agent_refs == snapshot.agent_refs
+                        ):
+                            # Stable authorization epoch; only renew the lease.
+                            renewed[request] = replace(
+                                snapshot, generation=previous.generation, renewable=True
+                            )
+                        else:
+                            self._generation += 1
+                            renewed[request] = replace(
+                                snapshot, generation=self._generation, renewable=True
+                            )
+                    # Retain source epochs separately from local continuity
+                    # generations: a reader failure must not reuse a generation.
+                    self._snapshots = renewed
+                    self._source_epochs = {
+                        request: snapshot.generation
+                        for request, snapshot in snapshots.items()
+                    }
                     self._revision, self._digest = revision, digest
+                    self._publisher_id = document["publisher_id"]
                 # Identical rereads preserve monotonic expiry and generation.
                 self._healthy = True
                 self._fresh_until = mono + _FRESH_SECONDS
@@ -143,10 +240,20 @@ class FileAgentSeatProvider:
         if (
             type(document) is not dict
             or set(document)
-            != {"version", "revision", "issued_at", "expires_at", "grants"}
+            != {
+                "version",
+                "revision",
+                "publisher_id",
+                "issued_at",
+                "expires_at",
+                "grants",
+            }
             or type(document["version"]) is not int
-            or document["version"] != 1
+            or document["version"] != 2
             or not _positive_int(document["revision"])
+            or type(document["publisher_id"]) is not str
+            or len(document["publisher_id"]) != 32
+            or any(c not in "0123456789abcdef" for c in document["publisher_id"])
             or not _finite_number(document["issued_at"])
             or not _finite_number(document["expires_at"])
             or not document["issued_at"] <= now < document["expires_at"]
@@ -163,6 +270,7 @@ class FileAgentSeatProvider:
                 "runtime_profile",
                 "agent_ids",
                 "status",
+                "authorization_epoch",
             }:
                 raise ValueError("invalid grant")
             url, profile, agents = (
@@ -186,6 +294,8 @@ class FileAgentSeatProvider:
                 or not all(_positive_int(agent) for agent in agents)
                 or len(set(agents)) != len(agents)
                 or grant["status"] != "active"
+                or not _positive_int(grant["authorization_epoch"])
+                or grant["authorization_epoch"] > document["revision"]
             ):
                 raise ValueError("invalid grant target or attestation")
             request = AgentSeatRequest(url, str(grant["user_id"]), profile)
@@ -194,7 +304,7 @@ class FileAgentSeatProvider:
             snapshots[request] = AgentSeatSnapshot(
                 request,
                 frozenset(str(agent) for agent in agents),
-                document["revision"],
+                grant["authorization_epoch"],
                 mono + document["expires_at"] - now,
                 "active",
             )

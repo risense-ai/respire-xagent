@@ -3945,3 +3945,19 @@ def test_memory_agent_seats_file_requires_absolute_host_path(monkeypatch, tmp_pa
     path = tmp_path / "grants.json"
     monkeypatch.setenv(config.MEMORY_AGENT_SEATS_FILE, f" {path} ")
     assert config.get_memory_agent_seats_file() == path
+
+
+@pytest.mark.parametrize("value", [None, "", "relative/config.json"])
+def test_memory_seat_publisher_requires_system_config(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv(config.MEMORY_SEAT_PUBLISHER_CONFIG, raising=False)
+    else:
+        monkeypatch.setenv(config.MEMORY_SEAT_PUBLISHER_CONFIG, value)
+    with pytest.raises(ValueError, match="absolute"):
+        config.get_memory_seat_publisher_config()
+
+
+def test_memory_seat_publisher_accepts_absolute_config(monkeypatch, tmp_path):
+    path = tmp_path / "publisher.json"
+    monkeypatch.setenv(config.MEMORY_SEAT_PUBLISHER_CONFIG, str(path))
+    assert config.get_memory_seat_publisher_config() == path

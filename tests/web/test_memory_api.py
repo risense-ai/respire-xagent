@@ -1141,7 +1141,7 @@ def test_memsrv_envelope_through_adapter_and_web(
         "/api/memory/list?category=general&limit=1", headers=auth_headers
     )
     assert calls[0]["headers"]["X-User-External-Id"] == str(test_db.id)
-    assert calls[0]["json"] == {"filters": {"category": "general"}}
+    assert calls[0]["json"] == {"filters": {"category": "general"}, "scope": "visible"}
     assert len(calls) == 1
     if truncated:
         assert response.status_code == 503

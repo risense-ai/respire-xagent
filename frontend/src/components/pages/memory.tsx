@@ -119,12 +119,13 @@ function resolveSimilarityThreshold(info: MemoryStoreInfo | null): number {
   return Math.min(Math.max(value, MIN_SIMILARITY_THRESHOLD), MAX_SIMILARITY_THRESHOLD)
 }
 
-// Only the two documented values are acted on; a missing or unknown scope is
+// Only documented values are acted on; a missing or unknown scope is
 // treated as "not reported" so the page looks exactly as it did before.
-function resolveStatsScope(scope?: string | null): "personal" | "org" | null {
+function resolveStatsScope(scope?: string | null): "personal" | "org" | "visible" | null {
   const normalized = (scope || "").toLowerCase()
   if (normalized === "org") return "org"
   if (normalized === "personal") return "personal"
+  if (normalized === "visible") return "visible"
   return null
 }
 
@@ -477,9 +478,9 @@ export function MemoryPage() {
         title={t("memory.header.title")}
         description={t("memory.header.description")}
         titleExtra={
-          statsScope === "org" ? (
+          statsScope === "org" || statsScope === "visible" ? (
             <Badge variant="secondary" className="rounded-md text-[10px] uppercase tracking-wide">
-              {t("memory.scope.org")}
+              {t(statsScope === "visible" ? "memory.scope.visible" : "memory.scope.org")}
             </Badge>
           ) : undefined
         }

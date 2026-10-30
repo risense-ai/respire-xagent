@@ -10,10 +10,14 @@ from pydantic import BaseModel, Field
 
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote, drop_replaced_tags
-from xagent.core.memory.remote import RemoteMemoryStoreError
+from xagent.core.memory.remote import RemoteMemoryStore, RemoteMemoryStoreError
 
 from ..auth_dependencies import get_current_user, is_admin_user
-from ..dynamic_memory_store import get_memory_store, get_memory_store_manager
+from ..dynamic_memory_store import (
+    get_memory_store,
+    get_memory_store_manager,
+    unwrap_memory_store,
+)
 from ..memory_lifecycle import MemoryUnavailableError
 from ..models.user import User
 from ..services.db_runtime import run_db_io_cancellation_safe
@@ -88,7 +92,7 @@ class MemoryListResponse(BaseModel):
         "personal",
         description=(
             "Coverage of this result set: 'org' for an administrator "
-            "(organisation-wide) or 'personal' for a regular user."
+            "(organisation-wide), 'personal', or 'visible' for remote ACL visibility."
         ),
     )
 
@@ -110,15 +114,15 @@ class MemoryStatsResponse(BaseModel):
     )
 
 
-def memory_scope(user: User) -> str:
+def memory_scope(user: User, store: MemoryStore | None = None) -> str:
     """Which surface this caller's memory reads cover (X-02).
 
-    Administrators aggregate the organisation's notes (the memory service
-    resolves the readable layers from the acting identity); a regular user
-    stays on their own notes. Both the list and the stats port report this
-    same value, so a UI can label the numbers and never present one caller's
-    count as the other's.
+    Remote reads explicitly request the service's existing visible ACL, which
+    may include personal, department and company notes. This is not an org
+    administrator query. Local stores retain their historical role labels.
     """
+    if store is not None and isinstance(unwrap_memory_store(store), RemoteMemoryStore):
+        return "visible"
     return "org" if is_admin_user(user) else "personal"
 
 
@@ -248,7 +252,7 @@ class MemoryManagementRouter:
                         memories=memory_dicts,
                         total_count=total_count,
                         filters_used=filters,
-                        scope=memory_scope(user),
+                        scope=memory_scope(user, self.memory_store),
                     )
             except HTTPException:
                 raise
@@ -380,10 +384,10 @@ class MemoryManagementRouter:
         async def get_memory_stats(
             user: User = Depends(get_current_user),
         ) -> MemoryStatsResponse:
-            scope = memory_scope(user)
             try:
                 # Set user context for memory operations
                 with UserContext(int(user.id)), memory_operation():
+                    scope = memory_scope(user, self.memory_store)
                     if scope == "org":
                         # X-02: an administrator's list is the organisation's
                         # notes (the service resolves the readable layers from
@@ -400,6 +404,9 @@ class MemoryManagementRouter:
                         )
                     else:
                         stats = self.memory_store.get_stats()
+                    # The route reports the adapter's actual collection, not
+                    # the xagent admin flag or a conflicting upstream field.
+                    stats.pop("scope", None)
                     return MemoryStatsResponse(**stats, scope=scope)
             except HTTPException:
                 raise

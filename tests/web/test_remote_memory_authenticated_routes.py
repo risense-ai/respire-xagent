@@ -132,3 +132,67 @@ def test_authenticated_routes_drive_real_adapter_with_synthetic_contract(
     assert all("X-Memory-Owner-Id" not in call[2] for call in calls)
     assert all(call[2]["X-User-External-Id"] == str(test_db.id) for call in calls[:-2])
     assert not any(method == "PUT" for method, _, _ in calls)
+
+
+def test_remote_list_and_stats_use_existing_visible_acl(
+    auth_headers: dict[str, str],
+    test_db: User,
+) -> None:
+    import json
+
+    import requests
+
+    from xagent.core.memory.remote import RemoteMemoryStore
+
+    calls: list[dict[str, Any]] = []
+    notes = [
+        {"id": "own", "content": "synthetic own", "space_kind": "personal"},
+        {
+            "id": "dept",
+            "content": "synthetic department",
+            "space_kind": "department",
+            "space_id": 10,
+        },
+        {"id": "company", "content": "synthetic company", "space_kind": "company"},
+    ]
+
+    def request(method: str, url: str, **kwargs: Any) -> requests.Response:
+        calls.append(kwargs)
+        if url.endswith("/list"):
+            assert method == "POST" and kwargs["json"]["scope"] == "visible"
+            payload = {"results": notes, "truncated": False, "scope": "visible"}
+        else:
+            assert method == "GET" and url.endswith("/stats")
+            assert kwargs["params"] == {"scope": "visible"}
+            payload = {
+                "total_count": 3,
+                "scope": "visible",
+                "category_counts": {},
+                "tag_counts": {},
+            }
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(payload).encode()
+        return response
+
+    transport = Mock(spec=requests.Session)
+    transport.request.side_effect = request
+    adapter = RemoteMemoryStore(
+        "http://memory-internal:8080", "runtime-only", session=transport
+    )
+    app = FastAPI()
+    app.include_router(MemoryManagementRouter(lambda: adapter).get_router())
+    app.dependency_overrides[get_db] = fixtures.override_get_db
+    with TestClient(app) as api:
+        listing = api.get("/api/memory/list", headers=auth_headers)
+        stats = api.get("/api/memory/stats", headers=auth_headers)
+        assert listing.status_code == stats.status_code == 200
+        assert listing.json()["scope"] == stats.json()["scope"] == "visible"
+        assert listing.json()["total_count"] == stats.json()["total_count"] == 3
+    assert len(calls) == 2
+    assert all(
+        call["headers"]["X-User-External-Id"] == str(test_db.id) for call in calls
+    )
+    assert all(
+        call["headers"]["Authorization"] == "Bearer runtime-only" for call in calls
+    )

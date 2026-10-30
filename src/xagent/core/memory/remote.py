@@ -872,8 +872,9 @@ class RemoteMemoryStore(MemoryStore):
     def _check_identity_binding(self, binding: _ParentIdentityBinding) -> None:
         """Recheck the captured user/mode/config/publication before I/O.
 
-        Re-publication or expiry invalidates this scope even if the new mapping
-        still includes the same seat. The caller must resolve a new scope;
+        Authority changes or expiry gaps invalidate the scope. A provider may
+        explicitly attest a continuous renewal of unchanged authorization.
+        Other re-publications require the caller to resolve a new scope;
         this method never refreshes, retries or switches to the parent identity.
         Already dispatched requests cannot be retroactively cancelled.
         """
@@ -895,7 +896,7 @@ class RemoteMemoryStore(MemoryStore):
         snapshot, epoch = _seat_snapshot(identity)
         if (
             epoch != binding.provider_generation
-            or snapshot != binding.snapshot
+            or not snapshot.continues(binding.snapshot)
             or binding.agent_ref not in snapshot.agent_refs
         ):
             raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
@@ -1565,7 +1566,9 @@ class RemoteMemoryStore(MemoryStore):
     def list_all(self, filters: Optional[dict[str, Any]] = None) -> List[MemoryNote]:
         path = "/v1/memory/list"
         response = self._request(
-            "POST", path, body={"filters": self._filters_payload(filters)}
+            "POST",
+            path,
+            body={"filters": self._filters_payload(filters), "scope": "visible"},
         )
         self._raise_for_error(path, response)
         payload = self._json(path, response)
@@ -1615,7 +1618,7 @@ class RemoteMemoryStore(MemoryStore):
 
     def get_stats(self) -> dict[str, Any]:
         path = "/v1/memory/stats"
-        response = self._request("GET", path)
+        response = self._request("GET", path, params={"scope": "visible"})
         self._raise_for_error(path, response)
         payload = self._json(path, response)
         if not isinstance(payload, dict):

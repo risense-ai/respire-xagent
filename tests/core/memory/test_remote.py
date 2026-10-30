@@ -579,7 +579,7 @@ def test_list_all_posts_filters() -> None:
     call = store.session.calls[-1]
     assert call["method"] == "POST"
     assert call["url"] == f"{SERVICE_URL}/v1/memory/list"
-    assert call["json"] == {"filters": {"category": "general"}}
+    assert call["json"] == {"filters": {"category": "general"}, "scope": "visible"}
 
 
 def test_list_all_opt_in_merges_scope_dimensions(scope: Any) -> None:
@@ -603,7 +603,7 @@ def test_list_all_requires_complete_results(count: int, filters: Any) -> None:
     else:
         assert len(store.list_all(filters)) == count
     assert len(store.session.calls) == 1
-    assert store.session.calls[0]["json"] == {"filters": filters}
+    assert store.session.calls[0]["json"] == {"filters": filters, "scope": "visible"}
 
 
 @pytest.mark.parametrize(
@@ -645,7 +645,7 @@ def test_get_stats_normalizes_the_contract_keys() -> None:
     call = store.session.calls[-1]
     assert call["method"] == "GET"
     assert call["url"] == f"{SERVICE_URL}/v1/memory/stats"
-    assert call["params"] is None
+    assert call["params"] == {"scope": "visible"}
 
 
 def test_get_stats_keeps_service_reported_store_type() -> None:
@@ -1745,6 +1745,7 @@ def test_memsrv_list_envelope_keeps_scope_and_completeness(
         assert notes[0].id == "scoped"
         assert notes[0].metadata["execution_scope_client_application_id"] == "42"
     assert store.session.calls[0]["json"] == {
+        "scope": "visible",
         "filters": {
             "category": "general",
             "metadata": {"execution_scope_client_application_id": "42"},

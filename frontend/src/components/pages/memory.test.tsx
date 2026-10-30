@@ -31,6 +31,7 @@ vi.mock("@/contexts/i18n-context", () => {
     "memory.filters.similarity.lenient": "Lenient",
     "memory.filters.similarity.tooltip": "Higher values match more loosely",
     "memory.scope.org": "Organization scope",
+    "memory.scope.visible": "Accessible memories",
     "memory.scope.personal": "My memories",
     "memory.item.owner": "user #{id}",
   }
@@ -296,6 +297,14 @@ describe("MemoryPage", () => {
 
     await waitFor(() => expect(screen.getByText("Organization scope")).toBeTruthy())
     expect(screen.getByText("user #2")).toBeTruthy()
+  })
+
+  it("labels remote ACL visibility without claiming organization administration", async () => {
+    mockBackend({ stats: { ...statsPayload, scope: "visible" }, memories: ownedMemories })
+    render(<MemoryPage />)
+
+    await waitFor(() => expect(screen.getByText("Accessible memories")).toBeTruthy())
+    expect(screen.queryByText("Organization scope")).toBeNull()
   })
 
   it("shows neither the org badge nor owner labels in the personal scope", async () => {

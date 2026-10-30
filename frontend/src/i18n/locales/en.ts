@@ -1625,6 +1625,7 @@ Build when you need.`,
     },
     scope: {
       org: "Organization scope",
+      visible: "Accessible memories",
       personal: "My memories",
     },
     filters: {

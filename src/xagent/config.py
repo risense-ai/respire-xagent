@@ -302,6 +302,7 @@ MEMORY_SERVICE_URL = "XAGENT_MEMORY_SERVICE_URL"
 MEMORY_SERVICE_KEY = "XAGENT_MEMORY_SERVICE_KEY"
 MEMORY_AGENT_SEATS = "XAGENT_MEMORY_AGENT_SEATS"
 MEMORY_AGENT_SEATS_FILE = "XAGENT_MEMORY_AGENT_SEATS_FILE"
+MEMORY_SEAT_PUBLISHER_CONFIG = "XAGENT_MEMORY_SEAT_PUBLISHER_CONFIG"
 
 WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
 
@@ -4037,4 +4038,13 @@ def get_memory_agent_seats_file() -> Path | None:
     path = Path(value)
     if not path.is_absolute():
         raise ValueError("memory agent seats file must be an absolute path")
+    return path
+
+
+def get_memory_seat_publisher_config() -> Path:
+    """System publisher only; never inject this config into execution services."""
+    value = os.getenv(MEMORY_SEAT_PUBLISHER_CONFIG, "").strip()
+    path = Path(value)
+    if not value or not path.is_absolute():
+        raise ValueError("publisher requires an absolute system config path")
     return path

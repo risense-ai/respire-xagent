@@ -1625,6 +1625,7 @@ const zh = {
     },
     scope: {
       org: "组织范围",
+      visible: "可访问的记忆",
       personal: "我的记忆",
     },
     filters: {

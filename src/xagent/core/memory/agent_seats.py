@@ -14,7 +14,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,23 @@ class AgentSeatSnapshot:
     generation: int
     valid_until: float
     status: str
+    renewable: bool = field(default=False, kw_only=True)
+
+    def continues(self, previous: AgentSeatSnapshot) -> bool:
+        """Only an explicitly continuous lease may change its deadline.
+
+        Renewable providers must fence a generation on revocation, authority
+        changes, expiry gaps and local failures, including unobserved gaps.
+        Legacy/custom publications retain exact-snapshot comparison.
+        """
+        return self == previous or (
+            self.renewable
+            and previous.renewable
+            and self.request == previous.request
+            and self.agent_refs == previous.agent_refs
+            and self.generation == previous.generation
+            and self.status == previous.status
+        )
 
 
 AgentSeatProvider = Callable[[AgentSeatRequest], AgentSeatSnapshot | None]
@@ -69,6 +86,7 @@ def read_agent_seat_snapshot(
         not isinstance(snapshot, AgentSeatSnapshot)
         or snapshot.request != request
         or snapshot.status != "active"
+        or type(snapshot.renewable) is not bool
         or type(snapshot.agent_refs) is not frozenset
         or any(
             not isinstance(ref, str)
