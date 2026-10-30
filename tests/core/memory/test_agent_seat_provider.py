@@ -311,3 +311,51 @@ def test_publisher_requires_verified_active_status(status):
             ttl_seconds=30,
             status=status,
         )
+
+
+@pytest.mark.parametrize("independent", [False, True])
+@pytest.mark.parametrize("change", ["mode", "user", "url", "key", "adapter_key"])
+def test_both_identity_modes_bind_entry_context_until_scope_exit(
+    publication, monkeypatch, independent, change
+):
+    _registry, _snapshot, transport, store, _clock = publication
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "1" if independent else "0")
+    with delegated_agent_identity(7, store=store):
+        store.search("valid entered scope")
+        if change == "mode":
+            monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "0" if independent else "1")
+        elif change == "user":
+            current_user_id.set(32)
+        elif change == "url":
+            monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", "http://other-service")
+        elif change == "key":
+            monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", "other-runtime-key")
+        else:
+            monkeypatch.setattr(store, "_service_key", "other-runtime-key")
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("changed context cannot reuse old scope")
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["headers"]["X-User-External-Id"] == (
+        "agent:7" if independent else "31"
+    )
+
+
+def test_explicit_parent_mode_needs_no_provider_and_resolves_a_fresh_scope_after_change(
+    publication, monkeypatch
+):
+    _registry, _snapshot, transport, store, _clock = publication
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "0")
+    set_trusted_agent_seat_provider(None)
+    with delegated_agent_identity(7, store=store):
+        store.search("parent request")
+        current_user_id.set(32)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("old parent user")
+        with delegated_agent_identity(7, store=store):
+            store.search("new parent user explicitly resolved")
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("restored old parent binding remains invalid")
+    assert [call["headers"]["X-User-External-Id"] for call in transport.calls] == [
+        "31",
+        "32",
+    ]
