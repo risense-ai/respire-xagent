@@ -367,3 +367,27 @@ def test_explicit_parent_mode_needs_no_provider_and_resolves_a_fresh_scope_after
         "31",
         "32",
     ]
+
+
+@pytest.mark.parametrize("independent", [False, True])
+@pytest.mark.parametrize("missing_identity", [None, 0, "", " "])
+def test_missing_identity_then_restoration_cannot_revive_bound_scope(
+    publication, monkeypatch, independent, missing_identity
+):
+    _registry, _snapshot, transport, store, _clock = publication
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "1" if independent else "0")
+    with delegated_agent_identity(7, store=store):
+        store.search("valid request")
+        current_user_id.set(missing_identity)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("missing identity must not dispatch")
+        assert len(transport.calls) == 1
+        current_user_id.set(31)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("restoring the user cannot revive the old binding")
+        assert len(transport.calls) == 1
+    store.search("outside the ended scope")
+    assert [call["headers"]["X-User-External-Id"] for call in transport.calls] == [
+        "agent:7" if independent else "31",
+        "31",
+    ]
