@@ -2735,9 +2735,9 @@ class AgentTool(AbstractBaseTool):
                     if self._execution_scope is not None
                     else nullcontext()
                 )
-                # T14 §0.2 item 6: run the child under its own seat when the
-                # memory service knows one for this target agent; otherwise this
-                # is a no-op and the child keeps the parent identity.
+                # Independent mode requires a current trusted seat publication.
+                # Missing mappings disable memory during preflight; a mapping
+                # revoked after preflight rejects further memory requests.
                 identity_context = _delegated_agent_identity_scope(
                     self._agent_id, delegated_memory
                 )

@@ -539,6 +539,13 @@ def resolve_remote_memory_policy(
     as well: the policy is validated fail-closed, and a task must not be handed
     memory tools that can only fail.
     """
+    if get_memory_backend() == "remote" and not request.is_preview:
+        try:
+            require_remote_memory_identity(request.user_id)
+        except RemoteMemoryStoreIdentityError as error:
+            return MemoryPolicyDecision(
+                enabled=False, available=False, reason=str(error)
+            )
     if (
         get_memory_backend() != "remote"
         or request.is_preview
@@ -548,10 +555,6 @@ def resolve_remote_memory_policy(
             enabled=not request.is_preview and request.agent_id is None,
             available=True,
         )
-    try:
-        require_remote_memory_identity(request.user_id)
-    except RemoteMemoryStoreIdentityError as error:
-        return MemoryPolicyDecision(enabled=False, available=False, reason=str(error))
     available, reason = remote_memory_ready()
     if not available:
         return MemoryPolicyDecision(

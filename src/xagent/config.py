@@ -4016,8 +4016,9 @@ def get_memory_agent_seats_enabled() -> bool:
     """Whether a delegated child may run under its own agent seat (T14 §0.2).
 
     On by default. The switch only gates the identity override: the memory
-    service still authorizes the selected seat, while
-    independent mode requires a known mapping and refuses missing mappings.
+    service still authorizes every request. Independent mode requires a trusted
+    host provider and refreshed active mappings in every worker; missing or
+    expired publications close memory for that delegated run.
     A disabled switch explicitly keeps the authenticated parent identity.
     """
     return _get_bool_env(MEMORY_AGENT_SEATS, True)

@@ -24,6 +24,7 @@ not about a re-implementation of them.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 from typing import cast
@@ -435,14 +436,28 @@ def _publish_remote_store(monkeypatch: pytest.MonkeyPatch, session: object) -> o
 
 
 def _patch_seats(monkeypatch: pytest.MonkeyPatch, answer: object) -> None:
-    from xagent.core.memory import remote as remote_module
+    from xagent.core.memory import agent_seats
 
+    registry = agent_seats.TrustedAgentSeatRegistry()
+    if callable(answer):
+
+        def provider(_request):
+            return answer()
+    else:
+        refs, _reason = answer
+        if refs is not None:
+            registry.publish(
+                service_url="http://memsrv:8080",
+                user_id=1,
+                runtime_profile=hashlib.sha256(b"svc-key").hexdigest(),
+                agent_ids=[int(ref) for ref in refs],
+                ttl_seconds=30,
+                status="active",
+            )
+        provider = registry
     monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "1")
-    monkeypatch.setattr(
-        remote_module,
-        "registered_agent_seats",
-        answer if callable(answer) else (lambda **_kwargs: answer),
-    )
+    monkeypatch.setattr(agent_seats, "_provider", provider)
+    monkeypatch.setattr(agent_seats, "_provider_generation", 1)
 
 
 async def _run_delegation_with_memory_call(
@@ -572,7 +587,9 @@ def test_missing_independent_mapping_never_probes_readiness(
 
     _select_remote(monkeypatch)
     monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "1")
-    monkeypatch.setattr(remote_module, "_agent_seats_cache", None)
+    from xagent.core.memory import agent_seats
+
+    monkeypatch.setattr(agent_seats, "_provider", None)
     monkeypatch.setattr(
         remote_module, "remote_memory_ready", lambda: pytest.fail("unexpected readyz")
     )
