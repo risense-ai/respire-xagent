@@ -77,6 +77,7 @@ from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
 from xagent.core.user_context import current_user_id
 
+from .agent_bindings import ApprovedAgentBinding, approved_bindings, find_binding
 from .agent_seats import (
     AgentSeatRequest,
     AgentSeatSnapshot,
@@ -210,9 +211,10 @@ def _record_upstream_answer(path: str, response: requests.Response) -> None:
     payload: Any
     try:
         payload = response.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         payload = None
     error = ((payload or {}).get("error") or {}) if isinstance(payload, dict) else {}
+    error = error if isinstance(error, dict) else {}
     now = time.time()
     with _upstream_health_lock:
         _upstream_health["last_event_at"] = now
@@ -335,6 +337,17 @@ class _AgentIdentityBinding(_ParentIdentityBinding):
     snapshot: AgentSeatSnapshot
     provider_generation: int
     agent_ref: str
+    owner_check: Callable[[], None] | None = field(default=None, kw_only=True)
+
+
+@dataclass(frozen=True)
+class _ConfiguredAgentIdentityBinding(_ParentIdentityBinding):
+    mapping: ApprovedAgentBinding
+    agent_ref: str
+    owner_check: Callable[[], None] | None = field(default=None, kw_only=True)
+
+
+_AGENT_BINDING_TYPES = (_AgentIdentityBinding, _ConfiguredAgentIdentityBinding)
 
 
 _agent_identity_override: ContextVar[_ParentIdentityBinding | None] = ContextVar(
@@ -450,10 +463,10 @@ def registered_agent_seats(
     *,
     user_id: Any = _USE_CONTEXT_IDENTITY,
     refresh: bool = False,
-    session: Optional[requests.Session] = None,
+    session: requests.Session | None = None,
     cached_only: bool = True,
-) -> tuple[Optional[frozenset[str]], Optional[str]]:
-    """Read a trusted local publication; never probes HTTP.
+) -> tuple[frozenset[str] | None, str | None]:
+    """Read approved initialization records or a trusted host mapping, without I/O.
 
     Legacy refresh/session/cached_only arguments are accepted for compatibility
     but cannot refresh a mapping or trigger I/O. The host must publish/refresh
@@ -461,9 +474,26 @@ def registered_agent_seats(
     """
     identity = require_remote_memory_identity(user_id)
     try:
+        mappings = approved_bindings()
+        if mappings is not None:
+            url, profile = _configured_identity_target()
+            refs = frozenset(
+                str(b.agent_id)
+                for b in mappings
+                if str(b.user_id) == identity
+                and b.service_url == url
+                and b.runtime_profile == profile
+            )
+            return (refs, None) if refs else (None, AGENT_SEAT_REQUIRED_REASON)
         snapshot, _ = _seat_snapshot(identity)
         return snapshot.agent_refs, None
-    except RemoteMemoryStoreIdentityError:
+    except (
+        RemoteMemoryStoreIdentityError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        OverflowError,
+    ):
         return None, AGENT_SEAT_REQUIRED_REASON
 
 
@@ -502,9 +532,10 @@ def _unwrap_remote_store(store: Optional[Any]) -> Optional["RemoteMemoryStore"]:
 
 
 def _delegated_identity_binding(
-    agent_id: Optional[int],
+    agent_id: int | None,
     *,
     user_id: Any = _USE_CONTEXT_IDENTITY,
+    owner_check: Callable[[], None] | None = None,
 ) -> _ParentIdentityBinding:
     identity = require_remote_memory_identity(user_id)
     url, fingerprint = _configured_identity_target()
@@ -512,15 +543,25 @@ def _delegated_identity_binding(
         return _ParentIdentityBinding(identity, url, fingerprint)
     if type(agent_id) is not int or agent_id <= 0:
         raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
+    try:
+        mapping = find_binding(identity, agent_id, url, fingerprint)
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON) from None
+    if mapping is not None:
+        return _ConfiguredAgentIdentityBinding(
+            identity, url, fingerprint, mapping, str(agent_id), owner_check=owner_check
+        )
     snapshot, epoch = _seat_snapshot(identity)
     ref = str(agent_id)
     if ref not in snapshot.agent_refs:
         raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
-    return _AgentIdentityBinding(identity, url, fingerprint, snapshot, epoch, ref)
+    return _AgentIdentityBinding(
+        identity, url, fingerprint, snapshot, epoch, ref, owner_check=owner_check
+    )
 
 
 def require_delegated_memory_identity(
-    agent_id: Optional[int],
+    agent_id: int | None,
     *,
     user_id: Any = _USE_CONTEXT_IDENTITY,
 ) -> str:
@@ -528,32 +569,36 @@ def require_delegated_memory_identity(
     binding = _delegated_identity_binding(agent_id, user_id=user_id)
     return (
         f"agent:{binding.agent_ref}"
-        if isinstance(binding, _AgentIdentityBinding)
+        if isinstance(binding, _AGENT_BINDING_TYPES)
         else binding.user_external_id
     )
 
 
 @contextmanager
 def delegated_agent_identity(
-    agent_id: Optional[int],
+    agent_id: int | None,
     *,
-    store: Optional[Any] = None,
+    store: Any | None = None,
     refresh: bool = False,
-    session: Optional[requests.Session] = None,
+    session: requests.Session | None = None,
+    owner_check: Callable[[], None] | None = None,
 ) -> Iterator[None]:
-    """Bind a delegated scope to its entry user/mode/config and any seat grant.
+    """Bind entry identity/config and a trusted mapping, without parent fallback.
 
-    Legacy refresh/session arguments never trigger a probe. Expired or replaced
-    mappings require the trusted host to publish and the caller to enter anew.
+    Approved initialization records require a backend ownership check and use
+    existing whoami to verify the selected IDs at entry. Legacy host providers
+    remain compatible. refresh/session never trigger organization enumeration.
     """
     remote_store = _unwrap_remote_store(store)
     if remote_store is None:
         yield
         return
     binding = _delegated_identity_binding(
-        agent_id, user_id=remote_store._user_id_provider()
+        agent_id, user_id=remote_store._user_id_provider(), owner_check=owner_check
     )
     remote_store._validate_identity_binding(binding)
+    if isinstance(binding, _ConfiguredAgentIdentityBinding):
+        remote_store._check_configured_mapping_selection(binding)
     token = _agent_identity_override.set(binding)
     try:
         yield
@@ -882,7 +927,7 @@ class RemoteMemoryStore(MemoryStore):
         if (
             identity != binding.user_external_id
             or get_memory_agent_seats_enabled()
-            is not isinstance(binding, _AgentIdentityBinding)
+            is not isinstance(binding, _AGENT_BINDING_TYPES)
             or url != binding.service_url
             or self._base_url != binding.service_url
             or fingerprint != binding.credential_fingerprint
@@ -890,7 +935,30 @@ class RemoteMemoryStore(MemoryStore):
             != binding.credential_fingerprint
         ):
             raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
-        if not isinstance(binding, _AgentIdentityBinding):
+        if not isinstance(binding, _AGENT_BINDING_TYPES):
+            return
+        if binding.owner_check is not None:
+            try:
+                binding.owner_check()
+            except RemoteMemoryStoreIdentityError:
+                raise
+            except Exception:  # noqa: BLE001 - unverifiable ownership ends the scope
+                raise RemoteMemoryStoreIdentityError(
+                    AGENT_SEAT_REQUIRED_REASON
+                ) from None
+        if isinstance(binding, _ConfiguredAgentIdentityBinding):
+            if binding.owner_check is None:
+                raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
+            try:
+                current = find_binding(
+                    identity, int(binding.agent_ref), url, fingerprint
+                )
+            except (ValueError, TypeError, RecursionError, OverflowError):
+                raise RemoteMemoryStoreIdentityError(
+                    AGENT_SEAT_REQUIRED_REASON
+                ) from None
+            if current != binding.mapping:
+                raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
             return
         snapshot, epoch = _seat_snapshot(identity)
         if (
@@ -900,6 +968,50 @@ class RemoteMemoryStore(MemoryStore):
         ):
             raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
 
+    def _check_configured_mapping_selection(
+        self, binding: _ConfiguredAgentIdentityBinding
+    ) -> None:
+        """Check existing selectors against trusted initialization IDs once.
+
+        whoami does not attest agent_owner_id. That relation must come from
+        the administrator's existing provisioning record in binding.mapping.
+        No organization enumeration, scope expansion or identity retry occurs.
+        """
+        for external, expected in (
+            (binding.user_external_id, binding.mapping.memory_user_id),
+            (f"agent:{binding.agent_ref}", binding.mapping.memory_agent_id),
+        ):
+            try:
+                response = self._session.request(
+                    "GET",
+                    f"{self._base_url}{WHOAMI_PATH}",
+                    headers={
+                        "Authorization": f"Bearer {self._service_key}",
+                        "X-User-External-Id": external,
+                        "User-Agent": MEMORY_SERVICE_USER_AGENT,
+                    },
+                    timeout=(self._connect_timeout, self._read_timeout),
+                    allow_redirects=False,
+                )
+                payload = response.json() if response.status_code == 200 else None
+                identity = (
+                    payload.get("identity") if isinstance(payload, dict) else None
+                )
+                scopes = payload.get("scopes") if isinstance(payload, dict) else None
+                if (
+                    not isinstance(identity, dict)
+                    or type(identity.get("id")) is not int
+                    or identity["id"] != expected
+                    or not isinstance(scopes, list)
+                    or any(type(scope) is not str for scope in scopes)
+                    or set(scopes) != {"memory:read", "memory:write"}
+                ):
+                    raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
+            except (requests.RequestException, ValueError):
+                raise RemoteMemoryStoreIdentityError(
+                    AGENT_SEAT_REQUIRED_REASON
+                ) from None
+
     def validate_identity_context(self) -> str:
         """Locally validate a user operation before data or user-health I/O."""
         binding = _agent_identity_override.get()
@@ -907,7 +1019,7 @@ class RemoteMemoryStore(MemoryStore):
             self._validate_identity_binding(binding)
             return (
                 f"agent:{binding.agent_ref}"
-                if isinstance(binding, _AgentIdentityBinding)
+                if isinstance(binding, _AGENT_BINDING_TYPES)
                 else binding.user_external_id
             )
         return require_remote_memory_identity(self._user_id_provider())
@@ -973,6 +1085,12 @@ class RemoteMemoryStore(MemoryStore):
                 f"Remote memory upstream unreachable (connection failure -- not "
                 f"a credential rejection): {method} {path} — {error}"
             ) from error
+        if response.status_code == 401:
+            binding = _agent_identity_override.get()
+            if isinstance(binding, _AGENT_BINDING_TYPES):
+                # Fence before response instrumentation can inspect an invalid
+                # body. A malformed rejection cannot leave the old scope live.
+                binding.invalidated.set()
         _record_upstream_answer(path, response)
         return response
 
@@ -988,9 +1106,10 @@ class RemoteMemoryStore(MemoryStore):
     def _raise_for_error(self, path: str, response: requests.Response) -> None:
         """Raise unless the service answered with a 2xx (§3.5.1).
 
-        A 401 is *classified* instead of being blamed on the credential by
-        default (缺陷一). The upstream answers a bad key, a revoked key and an
-        unknown ``X-User-External-Id`` with the very same generic
+        Independent scopes are permanently fenced on 401, without diagnostic
+        identity switching. Other 401s are classified instead of blaming the
+        credential by default (缺陷一). The upstream answers a bad key,
+        revoked key and unknown ``X-User-External-Id`` with the same generic
         ``{"error":{"code":"unauthorized","message":"unauthorized"}}`` body
         (Go ``internal/app/identity/service.go:28``), so the raised text is
         decided from observable evidence: credential wording in the upstream
@@ -1001,20 +1120,39 @@ class RemoteMemoryStore(MemoryStore):
         status = response.status_code
         if 200 <= status < 300:
             return
+        binding = _agent_identity_override.get()
+        independent_rejected = status == 401 and isinstance(
+            binding, _AGENT_BINDING_TYPES
+        )
+        if independent_rejected:
+            # A selected identity/key has been rejected. Fence before parsing
+            # the response, and do not retry or diagnose under a bare identity.
+            assert binding is not None
+            binding.invalidated.set()
         # the service's own message carries the repair ("send a follow-up delivery
         # instead" for a 409) — dropping it left the model retrying blind
         code: Optional[str] = None
         message = ""
         try:
             payload = response.json()
-            error = (payload or {}).get("error") or {}
+            error = payload.get("error") if isinstance(payload, dict) else None
+            error = error if isinstance(error, dict) else {}
             if isinstance(error.get("code"), str):
                 code = error["code"]
             if isinstance(error.get("message"), str):
                 message = error["message"]
-        except ValueError:
+        except (ValueError, RecursionError):
             pass
         if status == 401:
+            if independent_rejected:
+                code_note = f"（code={code}）" if code else ""
+                message_note = f"，上游 message: {message}" if message else ""
+                raise RemoteMemoryStoreAuthenticationError(
+                    f"上游拒绝了当前独立身份或凭据：HTTP 401{code_note} on "
+                    f"{path}{message_note}。当前记忆 scope 已失效；"
+                    "请核对上游身份/凭据，并重新进入独立 scope。",
+                    status_code=status,
+                )
             raise RemoteMemoryStoreAuthenticationError(
                 self._classify_401(path, code, message),
                 status_code=status,

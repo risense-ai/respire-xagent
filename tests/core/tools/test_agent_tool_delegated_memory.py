@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import requests
@@ -96,7 +96,7 @@ class _RecordingAgentService:
         return (context or {}).get("system_prompt")
 
 
-def _delegated_tool() -> AgentTool:
+def _delegated_tool(*, agent_owner_id: int = 1) -> AgentTool:
     return AgentTool(
         agent_id=1,
         agent_name="Delegated",
@@ -104,6 +104,8 @@ def _delegated_tool() -> AgentTool:
         session_factory=lambda: _DelegatedSession(
             SimpleNamespace(
                 id=1,
+                user_id=agent_owner_id,
+                status="published",
                 name="Delegated",
                 instructions=None,
                 knowledge_bases=None,
@@ -175,9 +177,11 @@ def _forbidden_store(message: str) -> object:
     return refuse
 
 
-async def _run_delegation(monkeypatch: pytest.MonkeyPatch) -> object:
+async def _run_delegation(
+    monkeypatch: pytest.MonkeyPatch, *, agent_owner_id: int = 1
+) -> object:
     _patch_runtime(monkeypatch)
-    tool = _delegated_tool()
+    tool = _delegated_tool(agent_owner_id=agent_owner_id)
     monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_k: None)
     return await tool.run_json_async({"task": "run"})
 
@@ -597,4 +601,86 @@ def test_missing_independent_mapping_never_probes_readiness(
         None,
         False,
         AGENT_SEAT_REQUIRED_REASON,
+    )
+
+
+@pytest.mark.asyncio
+async def test_owned_binding_runs_independently_without_installed_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.memory import agent_seats
+    from xagent.core.memory.remote import RemoteMemoryStore
+
+    _select_remote(monkeypatch)
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "true")
+    monkeypatch.setattr(agent_seats, "_provider", None)
+    monkeypatch.setenv(
+        "XAGENT_MEMORY_AGENT_BINDINGS",
+        json.dumps(
+            [
+                {
+                    "user_id": 1,
+                    "agent_id": 1,
+                    "memory_user_id": 101,
+                    "memory_agent_id": 202,
+                    "memory_agent_owner_id": 101,
+                    "service_url": "http://memsrv:8080",
+                    "runtime_profile": hashlib.sha256(b"svc-key").hexdigest(),
+                }
+            ]
+        ),
+    )
+    calls: list[tuple[str, str]] = []
+
+    class Session(requests.Session):
+        def request(self, *args: Any, **kwargs: Any) -> requests.Response:
+            _method, url = args
+            actor = kwargs["headers"]["X-User-External-Id"]
+            calls.append((url, actor))
+            response = requests.Response()
+            response.status_code = 200
+            payload = (
+                {
+                    "identity": {"id": 101 if actor == "1" else 202},
+                    "scopes": ["memory:read", "memory:write"],
+                }
+                if url.endswith("/whoami")
+                else {"results": []}
+            )
+            response._content = json.dumps(payload).encode()
+            return response
+
+    store = RemoteMemoryStore("http://memsrv:8080", "svc-key", session=Session())
+    _patch_published_store(monkeypatch, store)
+    _patch_readiness(monkeypatch, (True, None))
+
+    async def execute(self: _RecordingAgentService, **kwargs: object) -> dict[str, str]:
+        cast(RemoteMemoryStore, self.kwargs["memory"]).search(
+            "synthetic delegated memory"
+        )
+        return {"output": "child answer"}
+
+    monkeypatch.setattr(_RecordingAgentService, "execute_task", execute)
+    await _run_delegation(monkeypatch)
+    assert [actor for _, actor in calls] == ["1", "agent:1", "agent:1"]
+    assert not any("/org/" in url for url, _ in calls)
+    assert _RecordingAgentService.instances[0].kwargs["memory_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_executable_foreign_owned_agent_gets_no_memory_or_parent_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _select_remote(monkeypatch)
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "true")
+    _patch_published_store(
+        monkeypatch, _forbidden_store("foreign memory must not be acquired")
+    )
+    _patch_readiness(monkeypatch, (True, None))
+    await _run_delegation(monkeypatch, agent_owner_id=2)
+    child = _RecordingAgentService.instances[0]
+    assert child.kwargs["memory"] is None
+    assert child.kwargs["memory_enabled"] is False
+    assert (
+        child.kwargs["memory_availability_reason"] == "agent_memory_ownership_required"
     )
