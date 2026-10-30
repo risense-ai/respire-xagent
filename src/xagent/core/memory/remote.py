@@ -419,7 +419,12 @@ def delegated_agent_identity(
 
 @dataclass(frozen=True)
 class RemoteMemoryReadiness:
-    """Dependency health only; never evidence of a user's authorization."""
+    """Dependency health only; never evidence of a user's authorization.
+
+    Semantic capability describes the current embedder's state, not historical
+    vector coverage or reindex completion. Snapshots may be cached for 30s and
+    therefore do not promise real-time availability.
+    """
 
     status: str
     semantic_available: bool = False

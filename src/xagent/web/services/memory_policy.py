@@ -88,6 +88,16 @@ def _validate_decision(decision: object) -> None:
         and type(decision.semantic_available) is not bool
     ):
         raise TypeError("semantic availability must be bool")
+    if decision.remote_status is not None:
+        usable = decision.remote_status in {"ready", "degraded"}
+        semantic = decision.remote_status == "ready"
+        if (
+            decision.available is not usable
+            or decision.semantic_available is not semantic
+        ):
+            raise ValueError("remote memory state contradicts declared capabilities")
+        if decision.remote_status == "degraded" and decision.reason is None:
+            raise ValueError("degraded memory requires a reason")
     if decision.enabled and not decision.available:
         raise ValueError("unavailable memory cannot be enabled")
     if decision.reason is not None and (
