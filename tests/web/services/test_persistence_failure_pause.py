@@ -740,6 +740,10 @@ async def _resume_raising(
     ws_manager = MagicMock(broadcast_to_task=AsyncMock())
     publish_pause = AsyncMock()
     patches = [
+        patch(
+            "xagent.web.services.task_execution._load_task_agent_id",
+            new=AsyncMock(return_value=None),
+        ),
         patch("xagent.web.services.task_execution._settle_resumed_task_lease", settle),
         patch(
             "xagent.web.services.task_execution.stop_task_lease_heartbeat",

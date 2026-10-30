@@ -10,7 +10,8 @@ resolver to pin that:
 * the resolved scope is active inside the turn's execution context (visible
   to the agent build and the agent run),
 * the resumed turn re-resolves the scope (restart/resume correctness), and
-* with no resolver registered the turn runs unscoped, exactly as today.
+* resolver sandbox settings remain intact while server task-memory dimensions
+  are filled, including when no sandbox scope is supplied.
 """
 
 from __future__ import annotations
@@ -18,12 +19,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.agent.checkpoint import (
@@ -46,6 +52,7 @@ from xagent.web.services.task_command_execution import resume_task
 from xagent.web.services.task_execution import (
     ResumeReservationOutcome,
     _acquire_resume_task_lease,
+    _load_task_agent_id,
     execute_resume_background,
     execute_task_background,
 )
@@ -54,6 +61,67 @@ from xagent.web.services.task_lease_service import (
     TaskLeaseHeartbeatOutcome,
 )
 from xagent.web.services.task_settlement_report import SettlementReport
+
+
+@pytest.fixture(autouse=True)
+def _isolate_agent_id_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scope/lease unit doubles have no real task DB; isolate the added read.
+
+    The real imported reader is tested separately below with actual SQLite and
+    its worker-thread boundary. Background paths use this controlled result.
+    """
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution._load_task_agent_id",
+        AsyncMock(return_value=None),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("task_id", "expected"), [(42, 7), (43, None), (999, None)])
+async def test_resume_agent_id_reader_uses_short_worker_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_id: int,
+    expected: int | None,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'task-agent.db'}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE tasks(id INTEGER PRIMARY KEY, agent_id INTEGER)"
+        )
+        connection.exec_driver_sql("INSERT INTO tasks VALUES (42,7),(43,NULL)")
+    factory = sessionmaker(bind=engine)
+    event_thread = threading.get_ident()
+    observed_threads: list[int] = []
+
+    def checked_session() -> Session:
+        observed_threads.append(threading.get_ident())
+        return factory()
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution.get_session_local", lambda: checked_session
+    )
+    try:
+        assert await _load_task_agent_id(task_id) == expected
+        assert observed_threads and all(t != event_thread for t in observed_threads)
+        assert isinstance(engine.pool, QueuePool)
+        assert engine.pool.checkedout() == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resume_agent_id_reader_propagates_database_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable() -> Any:
+        raise SQLAlchemyTimeoutError("synthetic pool exhausted")
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution.get_session_local", unavailable
+    )
+    with pytest.raises(SQLAlchemyTimeoutError, match="synthetic pool exhausted"):
+        await _load_task_agent_id(42)
 
 
 def _make_task_orm() -> Task:
@@ -202,16 +270,16 @@ async def test_bg_turn_resolves_and_activates_scope() -> None:
         )
 
     assert resolver_calls == ["42"]
-    assert seen["scope_at_build"] is scope
-    assert seen["scope_at_run"] is scope
+    assert seen["scope_at_build"] == replace(scope, memory_dimensions={"task": "42"})
+    assert seen["scope_at_run"] is seen["scope_at_build"]
+    assert dict(scope.memory_dimensions) == {}
     # The scope is turn-local: nothing leaks past the turn.
     assert get_execution_scope() is None
 
 
 @pytest.mark.asyncio
-async def test_bg_turn_without_resolver_runs_unscoped() -> None:
-    """No resolver registered -> the turn executes unscoped (today's
-    behavior, byte-for-byte)."""
+async def test_bg_turn_without_resolver_stamps_task_memory_only() -> None:
+    """A default sandbox still receives the server's task memory dimension."""
     seen: dict[str, Any] = {}
     agent_service = MagicMock()
 
@@ -233,7 +301,7 @@ async def test_bg_turn_without_resolver_runs_unscoped() -> None:
             task_owner_user_id=1,
         )
 
-    assert seen["scope_at_run"] is None
+    assert seen["scope_at_run"] == ExecutionScope(memory_dimensions={"task": "42"})
 
 
 @pytest.mark.asyncio
@@ -264,10 +332,9 @@ async def test_bg_turn_explicit_unscoped_does_not_resolve_again() -> None:
             resolved_execution_scope=None,
         )
 
-    assert (
-        agent_manager.get_agent_for_task.await_args.kwargs["resolved_execution_scope"]
-        is None
-    )
+    assert agent_manager.get_agent_for_task.await_args.kwargs[
+        "resolved_execution_scope"
+    ] == ExecutionScope(memory_dimensions={"task": "42"})
 
 
 @pytest.mark.asyncio
@@ -490,7 +557,8 @@ async def test_resumed_turn_re_resolves_scope() -> None:
 
     agent_service.resume_execution_by_id.assert_awaited_once()
     assert resolver_calls == ["42"]
-    assert seen["scope_at_resume"] is scope
+    assert seen["scope_at_resume"] == replace(scope, memory_dimensions={"task": "42"})
+    assert dict(scope.memory_dimensions) == {}
     assert get_execution_scope() is None
 
 

@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from xagent.core.execution_scope import (
     EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    ExecutionScope,
     execution_scope_from_agent_config,
 )
 from xagent.core.task_runtime import TaskRuntimeContribution
@@ -239,8 +240,9 @@ async def test_task_create_drops_a_client_forged_execution_scope() -> None:
 
         db.expire_all()
         task = db.query(Task).filter(Task.id == task_id).one()
-        assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
-        assert execution_scope_from_agent_config(task.agent_config) is None
+        assert execution_scope_from_agent_config(task.agent_config) == ExecutionScope(
+            memory_dimensions={"task": str(task_id)}
+        )
         assert "victim-file-id" not in (
             task.agent_config.get(SELECTED_FILE_IDS_AGENT_CONFIG_KEY) or []
         )
