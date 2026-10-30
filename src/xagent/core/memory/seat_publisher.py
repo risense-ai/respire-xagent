@@ -76,9 +76,11 @@ class TrustedSeatPublisher:
         self._deadline = 0.0
         self._authorities: dict[AgentSeatRequest, tuple[VerifiedSeatGrant, int]] = {}
         self._lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
         self._stop = threading.Event()
         self._server: socketserver.UnixStreamServer | None = None
         self._thread: threading.Thread | None = None
+        self._verification_thread: threading.Thread | None = None
         self._writer_fd: int | None = None
 
     @staticmethod
@@ -86,7 +88,7 @@ class TrustedSeatPublisher:
         return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 
     @staticmethod
-    def _atomic_write(path: Path, raw: bytes) -> None:
+    def _prepare_write(path: Path, raw: bytes) -> Path:
         temporary = path.with_name(path.name + ".next")
         fd = os.open(
             temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
@@ -95,12 +97,21 @@ class TrustedSeatPublisher:
             output.write(raw)
             output.flush()
             os.fsync(output.fileno())
-        temporary.replace(path)
+        return temporary
+
+    @staticmethod
+    def _sync_directory(path: Path) -> None:
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
         finally:
             os.close(directory)
+
+    @classmethod
+    def _atomic_write(cls, path: Path, raw: bytes) -> None:
+        temporary = cls._prepare_write(path, raw)
+        temporary.replace(path)
+        cls._sync_directory(path)
 
     def _acquire_writer(self) -> None:
         lock_path = self.path.with_name(self.path.name + ".lock")
@@ -135,15 +146,19 @@ class TrustedSeatPublisher:
 
     def refresh(self) -> bool:
         """Reverify complete authorization. Any verifier failure revokes all."""
-        with self._lock:
-            if self._writer_fd is None or self._stop.is_set():
+        # Only verification/publication writers serialize here. Never hold the
+        # challenge-state lock over SQL, HTTP, serialization or durable writes.
+        with self._refresh_lock:
+            if self._writer_fd is None:
                 raise RuntimeError("publisher not started")
+            if self._stop.is_set():
+                return False
             verified_at = time.time(), time.monotonic()
             try:
                 grants = tuple(self.verifier())
             except Exception as error:  # noqa: BLE001 - host verifier failures must revoke
                 grants = ()
-                self._authorities = {}
+                self._invalidate_publication()
                 reason = (
                     str(error)
                     if isinstance(error, GrantVerificationError)
@@ -156,21 +171,24 @@ class TrustedSeatPublisher:
             try:
                 self._publish(grants, verified_at=verified_at)
             except (ValueError, TypeError, OverflowError, AttributeError):
-                self._current = None
-                self._authorities = {}
+                self._invalidate_publication()
                 if self._stop.is_set():
                     return False
                 try:
                     self._publish(())
-                except OSError:
+                except (OSError, ValueError):
                     return False
                 return False
             except OSError:
-                self._current = None
-                self._authorities = {}
+                self._invalidate_publication()
                 logger.warning("Memory grant publication unavailable")
                 return False
             return True
+
+    def _invalidate_publication(self) -> None:
+        with self._lock:
+            self._current = None
+            self._authorities = {}
 
     def _publish(
         self,
@@ -245,10 +263,19 @@ class TrustedSeatPublisher:
         # Reserve the new high-water mark before replacing the projection.
         self._atomic_write(self.journal, saved)
         self._revision = revision
-        self._atomic_write(self.path, raw)
-        self._current, self._authorities = document, authorities
-        self._digest = hashlib.sha256(raw).hexdigest()
-        self._deadline = verified_mono + self.ttl_seconds
+        temporary = self._prepare_write(self.path, raw)
+        digest = hashlib.sha256(raw).hexdigest()
+        with self._lock:
+            if self._stop.is_set():
+                temporary.unlink(missing_ok=True)
+                raise ValueError("publisher stopped before publication")
+            # One rename and an immutable-state swap. All preparation/fsync
+            # stays outside this short critical section used by challenges.
+            temporary.replace(self.path)
+            self._current, self._authorities = document, authorities
+            self._digest = digest
+            self._deadline = verified_mono + self.ttl_seconds
+        self._sync_directory(self.path)
 
     def _acknowledge(self, nonce: str) -> bytes:
         with self._lock:
@@ -291,39 +318,77 @@ class TrustedSeatPublisher:
                     except (OSError, UnicodeError):
                         return
 
-            self._server = socketserver.UnixStreamServer(str(path), Handler)
+            class Server(socketserver.ThreadingUnixStreamServer):
+                daemon_threads = True
+                block_on_close = False
+
+            self._server = Server(str(path), Handler)
             path.chmod(0o600)
             self._thread = threading.Thread(
                 target=self._run, name="memory-grant-publisher", daemon=True
             )
             self._thread.start()
+            self._verification_thread = threading.Thread(
+                target=self._verify_loop, name="memory-grant-verifier", daemon=True
+            )
+            self._verification_thread.start()
         except BaseException:
             self.close()
             raise
 
     def _run(self) -> None:
         assert self._server is not None
-        self._server.timeout = min(self.poll_seconds, 0.2)
-        next_refresh = time.monotonic() + self.poll_seconds
-        while not self._stop.is_set():
-            self._server.handle_request()
-            if not self._stop.is_set() and time.monotonic() >= next_refresh:
+        self._server.serve_forever(poll_interval=0.1)
+
+    def _verify_loop(self) -> None:
+        try:
+            while not self._stop.wait(self.poll_seconds):
                 self.refresh()
-                next_refresh = time.monotonic() + self.poll_seconds
+        finally:
+            if self._stop.is_set():
+                self._release_writer()
+
+    @property
+    def running(self) -> bool:
+        return (
+            not self._stop.is_set()
+            and self._thread is not None
+            and self._thread.is_alive()
+            and self._verification_thread is not None
+            and self._verification_thread.is_alive()
+        )
+
+    def _release_writer(self) -> None:
+        if not self._refresh_lock.acquire(timeout=0.1):
+            return
+        try:
+            if self._writer_fd is not None:
+                os.close(self._writer_fd)
+                self._writer_fd = None
+        finally:
+            self._refresh_lock.release()
 
     def close(self) -> None:
         # Bound shutdown even when a host verifier stalls. Do not release the
         # single-writer lock while that thread could still be executing.
         self._stop.set()
+        if (
+            self._server is not None
+            and self._thread is not None
+            and self._thread.is_alive()
+        ):
+            self._server.shutdown()
         if self._thread is not None:
-            self._thread.join(timeout=2)
-            if self._thread.is_alive():
-                return
+            if self._thread.ident is not None:
+                self._thread.join(timeout=2)
             self._thread = None
         if self._server is not None:
             self._server.server_close()
             Path(str(self.path) + ".sock").unlink(missing_ok=True)
             self._server = None
-        if self._writer_fd is not None:
-            os.close(self._writer_fd)
-            self._writer_fd = None
+        if self._verification_thread is not None:
+            if self._verification_thread.ident is not None:
+                self._verification_thread.join(timeout=2)
+            if not self._verification_thread.is_alive():
+                self._verification_thread = None
+        self._release_writer()

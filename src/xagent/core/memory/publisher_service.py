@@ -95,7 +95,7 @@ def main() -> int:
         publisher.start()
         logger.info("System memory-seat publisher started")
         while not stop.wait(1):
-            if publisher._thread is None or not publisher._thread.is_alive():
+            if not publisher.running:
                 raise RuntimeError("publisher refresh service stopped")
         return 0
     except Exception as error:  # noqa: BLE001 - keep credentials/DB URLs out of operator logs
