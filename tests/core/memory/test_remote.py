@@ -34,7 +34,6 @@ from xagent.core.execution_scope import (
 from xagent.core.memory import remote as remote_module
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.remote import (
-    AGENT_SEATS_PROBE_FAILED_REASON,
     NOT_FOUND_OR_DENIED_ERROR,
     READINESS_UNAVAILABLE_REASON,
     READINESS_UNCONFIGURED_REASON,

@@ -26,6 +26,8 @@ class AgentSeatRequest:
 
 @dataclass(frozen=True)
 class AgentSeatSnapshot:
+    """Verified active grant set; valid_until uses the local monotonic clock."""
+
     request: AgentSeatRequest
     agent_refs: frozenset[str]
     generation: int

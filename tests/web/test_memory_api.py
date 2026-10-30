@@ -754,3 +754,45 @@ class TestMemoryApiIntegration:
         )
         # Should fail due to missing required content field
         assert response.status_code == 422
+
+
+def test_store_info_establishes_authenticated_user_before_reporting(
+    client, auth_headers, test_db, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from xagent.core.user_context import current_user_id
+    from xagent.web import dynamic_memory_store as manager_module
+    from xagent.web.api import memory as api_module
+
+    monkeypatch.setenv("XAGENT_MEMORY_BACKEND", "remote")
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", "http://memsrv:8080")
+    monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", "runtime-key")
+    manager = manager_module.DynamicMemoryStoreManager()
+    manager.admit()
+    seen = []
+    guard = manager._guard_remote_report
+
+    def check(*, control_plane):
+        seen.append((current_user_id.get(), control_plane))
+        guard(control_plane=control_plane)
+
+    monkeypatch.setattr(manager, "_guard_remote_report", check)
+    monkeypatch.setattr(api_module, "get_memory_store_manager", lambda: manager)
+
+    # R2's reporting probe must observe the authenticated context when combined.
+    def health():
+        assert current_user_id.get() == test_db.id
+        return SimpleNamespace(
+            status="ready", available=True, semantic_available=True, reason=None
+        )
+
+    monkeypatch.setattr(
+        manager_module, "remote_memory_readiness", health, raising=False
+    )
+    response = client.get(
+        "/api/memory/store-info",
+        headers={**auth_headers, "X-User-External-Id": "agent:999"},
+    )
+    assert response.status_code == 200
+    assert seen == [(test_db.id, False)]
