@@ -311,3 +311,139 @@ def test_publisher_requires_verified_active_status(status):
             ttl_seconds=30,
             status=status,
         )
+
+
+@pytest.mark.parametrize("independent", [False, True])
+@pytest.mark.parametrize(
+    "change", ["user", "mode", "endpoint", "runtime_key", "adapter_key"]
+)
+def test_bound_scope_cannot_revive_after_context_is_restored(
+    publication: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    independent: bool,
+    change: str,
+) -> None:
+    _registry, _snapshot, transport, store, _clock = publication
+    initial_mode = "1" if independent else "0"
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", initial_mode)
+    with delegated_agent_identity(7, store=store):
+        store.search("valid request")
+        if change == "user":
+            current_user_id.set(32)
+        elif change == "mode":
+            monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "0" if independent else "1")
+        elif change == "endpoint":
+            monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", "http://other-service")
+        elif change == "runtime_key":
+            monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", "other-runtime-key")
+        else:
+            monkeypatch.setattr(store, "_service_key", "other-runtime-key")
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("changed context must not dispatch")
+        assert len(transport.calls) == 1
+        current_user_id.set(31)
+        monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", initial_mode)
+        monkeypatch.setenv("XAGENT_MEMORY_SERVICE_URL", URL)
+        monkeypatch.setenv("XAGENT_MEMORY_SERVICE_KEY", KEY)
+        monkeypatch.setattr(store, "_service_key", KEY)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("restoring values cannot revive the old scope")
+        assert len(transport.calls) == 1
+        with delegated_agent_identity(7, store=store):
+            store.search("a new explicitly resolved scope can use restored context")
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search(
+                "returning from the fresh nested scope restores the invalid old scope"
+            )
+    expected = "agent:7" if independent else "31"
+    assert [call["headers"]["X-User-External-Id"] for call in transport.calls] == [
+        expected,
+        expected,
+    ]
+
+
+@pytest.mark.parametrize("independent", [False, True])
+@pytest.mark.parametrize("missing_identity", [None, 0, "", " "])
+def test_missing_identity_permanently_invalidates_bound_scope(
+    publication: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    independent: bool,
+    missing_identity: Any,
+) -> None:
+    _registry, _snapshot, transport, store, _clock = publication
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "1" if independent else "0")
+    with delegated_agent_identity(7, store=store):
+        store.search("valid")
+        current_user_id.set(missing_identity)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("missing identity must not dispatch")
+        current_user_id.set(31)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("restoring the user cannot revive the old scope")
+        assert len(transport.calls) == 1
+    store.search("outside the ended scope")
+    assert len(transport.calls) == 2
+    assert transport.calls[-1]["headers"]["X-User-External-Id"] == "31"
+
+
+def test_explicit_parent_mode_stays_usable_without_provider(
+    publication: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _registry, _snapshot, transport, store, _clock = publication
+    monkeypatch.setenv("XAGENT_MEMORY_AGENT_SEATS", "0")
+    set_trusted_agent_seat_provider(None)
+    with delegated_agent_identity(7, store=store):
+        store.search("parent request")
+        current_user_id.set(32)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("old parent binding")
+        with delegated_agent_identity(7, store=store):
+            store.search("new parent binding")
+        current_user_id.set(31)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("old parent binding remains invalid")
+    assert [call["headers"]["X-User-External-Id"] for call in transport.calls] == [
+        "31",
+        "32",
+    ]
+
+
+@pytest.mark.parametrize("replacement", ["replace", "clear", "failure", "publication"])
+def test_provider_failure_or_replacement_cannot_revive_old_scope(
+    publication: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    registry, snapshot, transport, store, _clock = publication
+    state: dict[str, agent_seats.AgentSeatSnapshot | None] = {"snapshot": snapshot}
+
+    def provider(
+        _request: agent_seats.AgentSeatRequest,
+    ) -> agent_seats.AgentSeatSnapshot | None:
+        return state["snapshot"]
+
+    set_trusted_agent_seat_provider(provider)
+    with delegated_agent_identity(7, store=store):
+        store.search("valid")
+        if replacement == "replace":
+            set_trusted_agent_seat_provider(registry)
+        elif replacement == "clear":
+            set_trusted_agent_seat_provider(None)
+        elif replacement == "failure":
+            state["snapshot"] = None
+        else:
+            state["snapshot"] = replace(snapshot, generation=snapshot.generation + 1)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("provider or publication changed")
+        # A provider recovery may legitimately return the same still-valid
+        # snapshot. An already rejected scope must remain invalid either way.
+        state["snapshot"] = snapshot
+        if replacement in {"replace", "clear"}:
+            set_trusted_agent_seat_provider(provider)
+        with pytest.raises(RemoteMemoryStoreIdentityError):
+            store.search("restored provider cannot revive the old scope")
+        assert len(transport.calls) == 1
+        with delegated_agent_identity(7, store=store):
+            store.search("fresh scope uses the recovered provider")
+    assert len(transport.calls) == 2
