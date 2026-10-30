@@ -24,7 +24,7 @@ from typing import Optional, Union
 from ..core.memory.base import MemoryStore
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
-from ..core.memory.remote import RemoteMemoryStore, require_remote_memory_identity
+from ..core.memory.remote import RemoteMemoryStore
 from .memory_lifecycle import (
     AdmissionResult,
     AuthorityCredentialUnavailable,
@@ -338,7 +338,7 @@ class DynamicMemoryStoreManager:
             and publication is not None
             and isinstance(unwrap_memory_store(publication.store), RemoteMemoryStore)
         ):
-            require_remote_memory_identity()
+            unwrap_memory_store(publication.store).validate_identity_context()
 
     def status(self, *, control_plane: bool = False) -> MemoryLifecycleStatus:
         """Current public-safe lifecycle status. Never admits."""

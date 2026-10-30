@@ -158,16 +158,20 @@ _readiness_cache_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
-class _AgentIdentityBinding:
+class _ParentIdentityBinding:
     user_external_id: str
     service_url: str
     credential_fingerprint: str
+
+
+@dataclass(frozen=True)
+class _AgentIdentityBinding(_ParentIdentityBinding):
     snapshot: AgentSeatSnapshot
     provider_generation: int
     agent_ref: str
 
 
-_agent_identity_override: ContextVar[_AgentIdentityBinding | None] = ContextVar(
+_agent_identity_override: ContextVar[_ParentIdentityBinding | None] = ContextVar(
     "remote_memory_agent_identity", default=None
 )
 AGENT_SEATS_PROBE_FAILED_REASON = "agent_seat_probe_failed"
@@ -331,10 +335,11 @@ def _delegated_identity_binding(
     agent_id: Optional[int],
     *,
     user_id: Any = _USE_CONTEXT_IDENTITY,
-) -> _AgentIdentityBinding | None:
+) -> _ParentIdentityBinding:
     identity = require_remote_memory_identity(user_id)
+    url, fingerprint = _configured_identity_target()
     if not get_memory_agent_seats_enabled():
-        return None
+        return _ParentIdentityBinding(identity, url, fingerprint)
     if type(agent_id) is not int or agent_id <= 0:
         raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
     snapshot, epoch = _seat_snapshot(identity)
@@ -351,9 +356,12 @@ def require_delegated_memory_identity(
     user_id: Any = _USE_CONTEXT_IDENTITY,
 ) -> str:
     """Resolve a known identity locally before any readiness or data request."""
-    identity = require_remote_memory_identity(user_id)
     binding = _delegated_identity_binding(agent_id, user_id=user_id)
-    return f"agent:{binding.agent_ref}" if binding is not None else identity
+    return (
+        f"agent:{binding.agent_ref}"
+        if isinstance(binding, _AgentIdentityBinding)
+        else binding.user_external_id
+    )
 
 
 @contextmanager
@@ -364,7 +372,7 @@ def delegated_agent_identity(
     refresh: bool = False,
     session: Optional[requests.Session] = None,
 ) -> Iterator[None]:
-    """Bind a delegated scope to a publication; every request revalidates it.
+    """Bind a delegated scope to user/mode/config and any seat publication.
 
     Legacy refresh/session arguments never trigger a probe. Expired or replaced
     mappings require the trusted host to publish and the caller to enter anew.
@@ -376,8 +384,7 @@ def delegated_agent_identity(
     binding = _delegated_identity_binding(
         agent_id, user_id=remote_store._user_id_provider()
     )
-    if binding is not None:
-        remote_store._validate_agent_binding(binding)
+    remote_store._validate_identity_binding(binding)
     token = _agent_identity_override.set(binding)
     try:
         yield
@@ -604,8 +611,8 @@ class RemoteMemoryStore(MemoryStore):
     # identity and transport
     # ------------------------------------------------------------------
 
-    def _validate_agent_binding(self, binding: _AgentIdentityBinding) -> None:
-        """Recheck the captured user/config/publication immediately before I/O.
+    def _validate_identity_binding(self, binding: _ParentIdentityBinding) -> None:
+        """Recheck the captured user/mode/config/publication before each request.
 
         Re-publication or expiry invalidates this scope even if the new mapping
         still includes the same seat. The caller must resolve a new scope;
@@ -616,7 +623,8 @@ class RemoteMemoryStore(MemoryStore):
         url, fingerprint = _configured_identity_target()
         if (
             identity != binding.user_external_id
-            or not get_memory_agent_seats_enabled()
+            or get_memory_agent_seats_enabled()
+            is not isinstance(binding, _AgentIdentityBinding)
             or url != binding.service_url
             or self._base_url != binding.service_url
             or fingerprint != binding.credential_fingerprint
@@ -624,6 +632,8 @@ class RemoteMemoryStore(MemoryStore):
             != binding.credential_fingerprint
         ):
             raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
+        if not isinstance(binding, _AgentIdentityBinding):
+            return
         snapshot, epoch = _seat_snapshot(identity)
         if (
             epoch != binding.provider_generation
@@ -631,6 +641,18 @@ class RemoteMemoryStore(MemoryStore):
             or binding.agent_ref not in snapshot.agent_refs
         ):
             raise RemoteMemoryStoreIdentityError(AGENT_SEAT_REQUIRED_REASON)
+
+    def validate_identity_context(self) -> str:
+        """Validate the effective user/scope locally before data or user health I/O."""
+        identity = require_remote_memory_identity(self._user_id_provider())
+        binding = _agent_identity_override.get()
+        if binding is not None:
+            self._validate_identity_binding(binding)
+        return (
+            f"agent:{binding.agent_ref}"
+            if isinstance(binding, _AgentIdentityBinding)
+            else identity
+        )
 
     def _headers(self) -> dict[str, str]:
         """Build request headers (§3.4).
@@ -645,13 +667,7 @@ class RemoteMemoryStore(MemoryStore):
             "Authorization": f"Bearer {self._service_key}",
             "Content-Type": "application/json",
         }
-        identity = require_remote_memory_identity(self._user_id_provider())
-        binding = _agent_identity_override.get()
-        if binding is not None:
-            self._validate_agent_binding(binding)
-        headers["X-User-External-Id"] = (
-            f"agent:{binding.agent_ref}" if binding is not None else identity
-        )
+        headers["X-User-External-Id"] = self.validate_identity_context()
         explicit_owner = _explicit_owner_override.get()
         if explicit_owner is not None:
             headers[OWNER_HEADER] = str(explicit_owner)
