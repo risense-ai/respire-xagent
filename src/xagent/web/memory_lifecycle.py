@@ -50,7 +50,6 @@ from ..core.memory.lancedb_maintenance import (
     validate_lock_timeout,
 )
 from ..core.memory.remote import (
-    READINESS_UNAVAILABLE_REASON,
     RemoteMemoryReadiness,
     RemoteMemoryStoreConfigurationError,
     remote_memory_readiness,
