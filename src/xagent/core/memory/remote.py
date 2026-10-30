@@ -546,7 +546,7 @@ def _note_from_payload(data: Mapping[str, Any]) -> MemoryNote:
     """
     raw_content = data.get("content")
     content: Union[str, bytes]
-    if raw_content is None and data.get("content_b64"):
+    if raw_content is None and data.get("content_b64") is not None:
         try:
             content = base64.b64decode(str(data["content_b64"]))
         except (binascii.Error, ValueError):
@@ -862,6 +862,39 @@ class RemoteMemoryStore(MemoryStore):
         return payload
 
     @staticmethod
+    def _note_patch_payload(note: MemoryNote) -> dict[str, Any]:
+        """Serialize ordinary edits without identity or structural columns.
+
+        An omitted model field remains omitted; explicitly supplied empty lists
+        or metadata remain meaningful clears. Nonempty in-place edits to default
+        mutable fields are included. Protected metadata is preserved verbatim so
+        the server can accept unchanged values and reject attempted changes.
+        This is not a client-revision compare-and-swap contract.
+        """
+        fields = note.model_fields_set
+        payload: dict[str, Any] = {}
+        if "content" in fields:
+            if isinstance(note.content, bytes):
+                payload["content_b64"] = base64.b64encode(note.content).decode("ascii")
+            else:
+                payload["content"] = note.content
+        for key in ("keywords", "tags"):
+            value = getattr(note, key)
+            if key in fields or value:
+                payload[key] = list(value)
+        for key, default in (("category", "general"), ("mime_type", "text/plain")):
+            value = getattr(note, key)
+            if key in fields or value != default:
+                payload[key] = value
+        if "timestamp" in fields:
+            payload["timestamp"] = _format_timestamp(note.timestamp)
+        if "metadata" in fields or note.metadata:
+            payload["metadata"] = dict(note.metadata)
+        if not payload:
+            raise RemoteMemoryStoreError("Memory update has no editable fields")
+        return payload
+
+    @staticmethod
     def _note_path(note_id: str) -> str:
         return f"/v1/memory/notes/{quote(str(note_id), safe='')}"
 
@@ -979,11 +1012,36 @@ class RemoteMemoryStore(MemoryStore):
                 return existing
 
         path = self._note_path(note.id)
-        response = self._request("PUT", path, body=self._note_payload(note), write=True)
+        response = self._request(
+            "PATCH", path, body=self._note_patch_payload(note), write=True
+        )
         if response.status_code in (403, 404):
             return self._not_found_or_denied(note.id)
         self._raise_for_error(path, response)
-        return MemoryResponse(success=True, memory_id=note.id)
+        acknowledgement = self._json(path, response)
+        if (
+            not isinstance(acknowledgement, dict)
+            or acknowledgement.get("success") is not True
+            or acknowledgement.get("id") != note.id
+        ):
+            raise RemoteMemoryStoreError(
+                "Remote memory PATCH returned an invalid acknowledgement"
+            )
+        return MemoryResponse(
+            success=True,
+            memory_id=note.id,
+            metadata={
+                key: acknowledgement[key]
+                for key in (
+                    "owner_id",
+                    "space_kind",
+                    "space_id",
+                    "modified_by",
+                    "degraded",
+                )
+                if key in acknowledgement
+            },
+        )
 
     def delete(self, note_id: str, *, owner_id: Optional[int] = None) -> MemoryResponse:
         """Delete a note, optionally in ``owner_id``'s memory (T14 §B1-2).
