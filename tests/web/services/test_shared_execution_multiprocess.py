@@ -102,7 +102,10 @@ def _execution_host(pipe, env, task_id):
             owner_id = db.get(Task, task_id).user_id
         snapshot = SimpleNamespace(
             task=SimpleNamespace(
-                user_id=owner_id, status=TaskStatus.RUNNING, source="internal"
+                user_id=owner_id,
+                status=TaskStatus.RUNNING,
+                source="internal",
+                agent_id=None,
             ),
             runtime_user=object(),
             conversation_history=(),
