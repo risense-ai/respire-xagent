@@ -64,7 +64,7 @@ def owned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setenv("XAGENT_MEMORY_AGENT_BINDINGS", json.dumps([record]))
     monkeypatch.setattr(agent_seats, "_provider", None)
     calls: list[dict[str, Any]] = []
-    state = {"person": 101, "agent": 202, "status": 200}
+    state: dict[str, Any] = {"person": 101, "agent": 202, "status": 200}
 
     def request(method: str, url: str, **kwargs: Any) -> requests.Response:
         calls.append({"method": method, "url": url, **kwargs})
@@ -74,6 +74,15 @@ def owned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         if url.endswith("/v1/whoami"):
             response.status_code = state["status"]
             identity = kwargs["headers"].get("X-User-External-Id", "31")
+            # memsrv Authenticate: a non-admin user key selects its bound
+            # person or a direct ManagerID child; AgentOwnerID is not that
+            # selection predicate. These are synthetic server-contract data.
+            if (
+                state.get("user_key")
+                and identity == "agent:7"
+                and state.get("manager_id") != state["person"]
+            ):
+                response.status_code = 401
             payload = {
                 "scopes": ["memory:read", "memory:write"],
                 "identity": {
@@ -177,6 +186,31 @@ def test_business_permission_denial_does_not_invalidate_identity_scope(
         state["data_status"] = 200
         store.search("another permitted operation in the same identity scope")
         assert len(calls) == answered + 1
+
+
+@pytest.mark.parametrize("manager_id", [None, 999, 101])
+def test_restricted_user_key_requires_selectable_manager_binding(
+    owned: Any, manager_id: int | None
+) -> None:
+    _engine, record, state, calls, store, check = owned
+    # The trusted ownership record remains correct in all three cases.
+    assert record["memory_agent_owner_id"] == state["person"]
+    state.update(user_key=True, manager_id=manager_id)
+    if manager_id == state["person"]:
+        with delegated_agent_identity(7, store=store, owner_check=check):
+            store.search("owned and selectable with the existing user key")
+        assert calls[-1]["url"].endswith("/v1/memory/search")
+        assert calls[-1]["headers"]["X-User-External-Id"] == "agent:7"
+    else:
+        with (
+            pytest.raises(RemoteMemoryStoreIdentityError),
+            delegated_agent_identity(7, store=store, owner_check=check),
+        ):
+            pytest.fail("ownership alone does not make a user-key selector valid")
+        assert len(calls) == 2
+        assert all(call["url"].endswith("/v1/whoami") for call in calls)
+    assert all(call["headers"]["Authorization"] == f"Bearer {KEY}" for call in calls)
+    assert not any("/org/" in call["url"] for call in calls)
 
 
 def test_team_execution_permission_is_not_personal_memory_ownership(owned: Any) -> None:
